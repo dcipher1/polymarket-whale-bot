@@ -1,0 +1,394 @@
+[
+  {
+    "address": "0x96489abcb9f583d6835c8ef95ffc923d05a86825",
+    "name": "anoin123",
+    "pnl": 82386.53545423597,
+    "volume": 192701.29481999998,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0xdecc9cdbbee192e0313134b2fd0145abc6542683",
+    "name": "fdgdfhfgh8456",
+    "pnl": 32264.684141045316,
+    "volume": 116367.23410200002,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0x5fe14b52584c83c18496914db0b30a28d4510981",
+    "name": "Bitara",
+    "pnl": 28832.55717222341,
+    "volume": 128646.001567,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0xbad457dc633bbb7b6cbe09dd5867a5e8e597acd7",
+    "name": "Curseaaaaaaaa",
+    "pnl": 24539.922050400055,
+    "volume": 0.0,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0x4bbe10ba5b7f6df147c0dae17b46c44a6e562cf3",
+    "name": "How.Dare.You",
+    "pnl": 23433.37472244847,
+    "volume": 165009.815525,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0xa2536f292681daff7a048ab51fab6bdf81ecc48f",
+    "name": "switjoe",
+    "pnl": 22629.167226823512,
+    "volume": 480565.87401900004,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0x1521b47bf0c41f6b7fd3ad41cdec566812c8f23e",
+    "name": "alliswell",
+    "pnl": 22211.561488943,
+    "volume": 763877.935426,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0xc851cd9bee7d262afd78674f861f9f576a12cd2a",
+    "name": "betwick",
+    "pnl": 21579.763381668658,
+    "volume": 166708.649025,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0xa7d1ae08567d192db3c3cf1858c62c76dc8cb824",
+    "name": "Cinibengales",
+    "pnl": 20629.048764048,
+    "volume": 0.0,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0xd7f85d0eb0fe0732ca38d9107ad0d4d01b1289e4",
+    "name": "tdrhrhhd",
+    "pnl": 20510.36940202699,
+    "volume": 49070.385139000005,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0x9c6cecbb5541e2706d26b01389992af0db5b00b9",
+    "name": "Zaunkoenig",
+    "pnl": 19731.477960000004,
+    "volume": 39542.04,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0xe25b9180f5687aa85bd94ee309bb72a464320f1b",
+    "name": "WordleAddict",
+    "pnl": 17615.794123785454,
+    "volume": 229999.593205,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0xde17f7144fbd0eddb2679132c10ff5e74b120988",
+    "name": "0xdE17f7144fbD0eddb2679132C10ff5e74B120988-1772205225932",
+    "pnl": 16793.0633703497,
+    "volume": 374229.697726,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0x63ce342161250d705dc0b16df89036c8e5f9ba9a",
+    "name": "0x8dxd",
+    "pnl": 14044.977752426174,
+    "volume": 534613.746375,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0xdbade4c82fb72780a0db9a38f821d8671aba9c95",
+    "name": "SwissMiss",
+    "pnl": 13732.026304874104,
+    "volume": 427330.033468,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0xa3e1664fc43903ac3010c89fa3dd00828f665968",
+    "name": "sd13",
+    "pnl": 13681.272099018504,
+    "volume": 0.0,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0x44c1dfe43260c94ed4f1d00de2e1f80fb113ebc1",
+    "name": "aenews2",
+    "pnl": 13388.329641725635,
+    "volume": 631672.2553620001,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0x098fab4f4981110aeef16b20289cfa9f808a2a72",
+    "name": "0xA9LZ86431AJEWQ4823ASRqR89L08xz9pLCPzo9z",
+    "pnl": 13253.724818436807,
+    "volume": 224728.288199,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0x2eb5714ff6f20f5f9f7662c556dbef5e1c9bf4d4",
+    "name": "0x2Eb5714FF6f20f5F9f7662c556DBEF5e1c9bf4D",
+    "pnl": 12260.185569150286,
+    "volume": 1818642.8938429998,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0x1f0ebc543b2d411f66947041625c0aa1ce61cf86",
+    "name": "0x1f0ebc543B2d411f66947041625c0Aa1ce61CF86-1772205597930",
+    "pnl": 11494.835286269343,
+    "volume": 991729.562459,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0xab828a2bcb4a5a93a94cdeedf3cb70b6211babe5",
+    "name": "Nsuuuuhs",
+    "pnl": 11373.495969871628,
+    "volume": 64124.128034,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0xd84c2b6d65dc596f49c7b6aadd6d74ca91e407b9",
+    "name": "BoneReader",
+    "pnl": 10739.63097905321,
+    "volume": 1570675.935932,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0x0b79ec091819b05dc86ff14a9b074e181654b400",
+    "name": "ultraxion",
+    "pnl": 10630.484083994923,
+    "volume": 397862.0227920001,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0xc02147dee42356b7a4edbb1c35ac4ffa95f61fa8",
+    "name": "Eatpraylove",
+    "pnl": 10312.881647753238,
+    "volume": 599306.504309,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0xd0d6053c3c37e727402d84c14069780d360993aa",
+    "name": "k9Q2mX4L8A7ZP3R",
+    "pnl": 10087.912171229487,
+    "volume": 1060022.0824000002,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0xd058d668771b6f4d0f8ee4c345089e369d98c532",
+    "name": "niki34",
+    "pnl": 10055.897400000005,
+    "volume": 0.0,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0x0ca2172d7371373a92c9560cb71b42a3908b5818",
+    "name": "Muahhz",
+    "pnl": 9786.0,
+    "volume": 0.0,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0xa8b202e6e9a4c2091b6860f1f5c9e9119bbc9a39",
+    "name": "CZ-The-Top-Bettor",
+    "pnl": 9078.38784934373,
+    "volume": 566357.5899670001,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0x5da48936d61eb18d66ca5fdd32ba2d2ba19be203",
+    "name": "768543265",
+    "pnl": 9000.314072267036,
+    "volume": 0.0,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0xbb04b21ed2cefd4d9d0320f6585ff575367d648c",
+    "name": "fourfive",
+    "pnl": 8317.104360000012,
+    "volume": 0.0,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0x7744bfd749a70020d16a1fcbac1d064761c9999e",
+    "name": "chungguskhan",
+    "pnl": 8004.9644330877345,
+    "volume": 36505.824835,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0x0a854897a06d4999e5b2dde5693609f1428ffe9d",
+    "name": "TheQuietRisk",
+    "pnl": 7649.399419125984,
+    "volume": 0.0,
+    "category": "politics",
+    "api_category": "politics"
+  },
+  {
+    "address": "0x03aaf3f6ab284dba5a6494c201122472a44e7d3d",
+    "name": "0x03aAF3f6Ab284dba5A6494c201122472A44e7D3D-1773415818924",
+    "pnl": 7388.7228239999995,
+    "volume": 17082.768509,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0xa3d043b2da34f58045c6485d3f89b798b2b0ec04",
+    "name": "0xa3d043b2da34f58045c6485d3f89b798b2b0ec04",
+    "pnl": 7144.907928032393,
+    "volume": 35164.243696000005,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0xa45fe11dd1420fca906ceac2c067844379a42429",
+    "name": "guh123",
+    "pnl": 7140.5918596175325,
+    "volume": 1745207.899256,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0x2e7851eb8a9aa68e374563b9a907bfb1dce1663a",
+    "name": "Cacabes",
+    "pnl": 7125.111844699481,
+    "volume": 45626.096124,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0xf6963d4cdbb6f26d753bda303e9513132afb1b7d",
+    "name": "rename",
+    "pnl": 7055.995454945776,
+    "volume": 164517.519853,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0x3b5a5271122cab38828140c815df362409d5b293",
+    "name": "predictgenius",
+    "pnl": 6859.283828339423,
+    "volume": 230594.795699,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0x818f214c7f3e479cce1d964d53fe3db7297558cb",
+    "name": "livebreathevolatility",
+    "pnl": 6719.365294676565,
+    "volume": 703542.9683689999,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0x29bc82f761749e67fa00d62896bc6855097b683c",
+    "name": "BoshBashBish",
+    "pnl": 6454.976116681588,
+    "volume": 1038857.0626010001,
+    "category": "crypto",
+    "api_category": "crypto"
+  },
+  {
+    "address": "0xfdc07e182e6f959256295567e450a8727272fa79",
+    "name": "FedWillWin",
+    "pnl": 4644.851060000248,
+    "volume": 0.0,
+    "category": "macro",
+    "api_category": "economics"
+  },
+  {
+    "address": "0xc8ab97a9089a9ff7e6ef0688e6e591a066946418",
+    "name": "ArmageddonRewardsBilly",
+    "pnl": 3290.2583725887816,
+    "volume": 38925.627236,
+    "category": "macro",
+    "api_category": "economics"
+  },
+  {
+    "address": "0xe9514aa0b925353ea0d5e32978d636ec25ebde18",
+    "name": "b2d0",
+    "pnl": 2559.890197330009,
+    "volume": 0.0,
+    "category": "macro",
+    "api_category": "economics"
+  },
+  {
+    "address": "0xbebe49168cc3fe33fd9060c6fc83355c3359a8b5",
+    "name": "MoronKiler",
+    "pnl": 2157.7168231960386,
+    "volume": 0.0,
+    "category": "macro",
+    "api_category": "economics"
+  },
+  {
+    "address": "0xa52b785a5510117ac3ae03d75d029f89a36c9480",
+    "name": "Hashbrown",
+    "pnl": 1460.9955302699964,
+    "volume": 0.0,
+    "category": "macro",
+    "api_category": "economics"
+  },
+  {
+    "address": "0x71edffd0d70a1da823ff07a3c6fc81457294d338",
+    "name": "pako",
+    "pnl": 1327.6054065335775,
+    "volume": 98681.34713600001,
+    "category": "macro",
+    "api_category": "economics"
+  },
+  {
+    "address": "0xf80397a15cb99414f9148fcb69dbfe5092384068",
+    "name": "weidah",
+    "pnl": 1304.7498519299988,
+    "volume": 0.0,
+    "category": "macro",
+    "api_category": "economics"
+  },
+  {
+    "address": "0x014c4e7ae2145992861c2d1b124af633a97f820c",
+    "name": "Hyperlong",
+    "pnl": 1054.7732175580818,
+    "volume": 9750.41,
+    "category": "macro",
+    "api_category": "economics"
+  },
+  {
+    "address": "0x14619de097b1fbe058d6d36282662c20958a30a1",
+    "name": "fwed33",
+    "pnl": 1044.2872444299965,
+    "volume": 300.0,
+    "category": "macro",
+    "api_category": "economics"
+  }
+]
