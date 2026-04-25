@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     candidate_min_win_rate: float = 0.55
     candidate_min_profit_factor: float = 1.3
     candidate_min_trade_count: int = 10
-    max_trades_per_month: int = 2000  # used by trade_monitor polling filter only
+    max_trades_per_month: int = 2000
     max_qualifying_trade_age_days: int = 30
     min_followability: float = 0.50
     min_conviction_score: int = 40
@@ -144,7 +144,7 @@ class Settings(BaseSettings):
     max_unresolved_past_resolution_markets: int = 10
 
     # Position sizing
-    fixed_position_size_usdc: float = 100
+    fixed_position_size_usdc: float = 50
     convergence_scale_enabled: bool = True
     category_multiplier_crypto_weekly: float = 1.2
     category_multiplier_crypto_monthly: float = 1.0
@@ -155,9 +155,6 @@ class Settings(BaseSettings):
     category_multiplier_culture: float = 0.8
     category_multiplier_tech: float = 0.8
     category_multiplier_weather: float = 1.0
-
-    # MM detection
-    mm_both_sides_threshold: int = 10
 
     # Capital
     starting_capital: float = 15_000

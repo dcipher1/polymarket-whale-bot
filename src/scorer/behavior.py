@@ -48,32 +48,39 @@ async def compute_behavior(
     )
     trades_per_month = total_trades / months_active
 
-    # Hold duration — from positions
-    result = await session.execute(
-        select(WhalePosition).where(
-            and_(
-                WhalePosition.wallet_address == wallet_address,
-                WhalePosition.first_entry.isnot(None),
-                WhalePosition.last_updated.isnot(None),
-            )
+    # Hold duration and resolution-holding — from trades
+    hold_result = await session.execute(
+        select(
+            WhaleTrade.condition_id,
+            WhaleTrade.outcome,
+            func.min(WhaleTrade.timestamp).label("first_trade"),
+            func.max(WhaleTrade.timestamp).label("last_trade"),
+            func.bool_or(WhaleTrade.side == "SELL").label("has_sell"),
+            Market.resolved,
+            Market.resolution_time,
         )
+        .join(Market, WhaleTrade.condition_id == Market.condition_id)
+        .where(WhaleTrade.wallet_address == wallet_address)
+        .group_by(WhaleTrade.condition_id, WhaleTrade.outcome, Market.resolved, Market.resolution_time)
     )
-    positions = result.scalars().all()
+    hold_rows = hold_result.all()
 
     hold_hours_list = []
     held_to_resolution = 0
     total_resolved = 0
 
-    for pos in positions:
-        if pos.first_entry and pos.last_updated:
-            hours = (pos.last_updated - pos.first_entry).total_seconds() / 3600
+    for row in hold_rows:
+        if row.first_trade and row.last_trade:
+            if not row.has_sell and row.resolved and row.resolution_time:
+                # True hold-to-resolution: measure from entry to market close
+                hours = (row.resolution_time - row.first_trade).total_seconds() / 3600
+            else:
+                # Sold before resolution, or unresolved: measure between trades
+                hours = (row.last_trade - row.first_trade).total_seconds() / 3600
             hold_hours_list.append(hours)
-
-        # Check if held to resolution
-        if pos.last_event_type in ("OPEN", "ADD") and not pos.is_open:
+        if row.resolved:
             total_resolved += 1
-            # If close event wasn't a SELL (i.e., market resolved while holding)
-            if pos.last_event_type != "CLOSE":
+            if not row.has_sell:
                 held_to_resolution += 1
 
     median_hold = float(np.median(hold_hours_list)) if hold_hours_list else 0
@@ -94,36 +101,10 @@ async def compute_behavior(
     total_pnl = float(wallet.total_pnl_usdc) if wallet else 0
     estimated_bankroll = max(current_deployed + abs(total_pnl), current_deployed * 2)
 
-    # Conviction score components
-    freq_score = _frequency_score(trades_per_month)
+    # Conviction score: hold duration (30%) + resolution holding (70%)
     hold_score = _hold_duration_score(median_hold)
     resolution_score = _resolution_holding_score(pct_resolution)
-
-    # Concentration score
-    if estimated_bankroll > 0 and positions:
-        avg_position = sum(
-            float(p.total_size_usdc or 0) for p in positions
-        ) / len(positions)
-        ratio = avg_position / estimated_bankroll
-        conc_score = _concentration_score(ratio)
-    else:
-        # Skip concentration, reweight others
-        conc_score = None
-
-    if conc_score is not None:
-        conviction = (
-            freq_score * 0.25
-            + hold_score * 0.25
-            + resolution_score * 0.30
-            + conc_score * 0.20
-        )
-    else:
-        # Reweight without concentration
-        conviction = (
-            freq_score * 0.3125
-            + hold_score * 0.3125
-            + resolution_score * 0.375
-        )
+    conviction = hold_score * 0.30 + resolution_score * 0.70
 
     conviction_score = int(max(0, min(100, round(conviction))))
 
@@ -136,43 +117,23 @@ async def compute_behavior(
     )
 
 
-def _frequency_score(trades_per_month: float) -> float:
-    if trades_per_month <= 20:
-        return 100
-    elif trades_per_month <= 50:
-        return 100 - (trades_per_month - 20) / 30 * 30  # 100 → 70
-    elif trades_per_month <= 100:
-        return 70 - (trades_per_month - 50) / 50 * 40  # 70 → 30
-    else:
-        return 0
-
-
 def _hold_duration_score(median_hold_hours: float) -> float:
-    if median_hold_hours >= 168:
+    if median_hold_hours >= 72:
         return 100
-    elif median_hold_hours >= 48:
-        return 40 + (median_hold_hours - 48) / (168 - 48) * 60  # 40 → 100
     elif median_hold_hours >= 24:
-        return 40
+        return 50 + (median_hold_hours - 24) / 48 * 50  # 50 → 100
+    elif median_hold_hours >= 4:
+        return 20 + (median_hold_hours - 4) / 20 * 30  # 20 → 50
     else:
-        return 0
+        return 20
 
 
 def _resolution_holding_score(pct: float) -> float:
     if pct >= 0.80:
         return 100
     elif pct >= 0.50:
-        return 20 + (pct - 0.50) / 0.30 * 80  # 20 → 100
+        return 40 + (pct - 0.50) / 0.30 * 60  # 40 → 100
+    elif pct >= 0.20:
+        return 10 + (pct - 0.20) / 0.30 * 30  # 10 → 40
     else:
-        return 20
-
-
-def _concentration_score(ratio: float) -> float:
-    if ratio >= 0.05:
-        return 100
-    elif ratio >= 0.02:
-        return (ratio - 0.02) / 0.03 * 100  # 0 → 100
-    elif ratio >= 0.01:
-        return 20
-    else:
-        return 20
+        return 10

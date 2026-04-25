@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.db import async_session
+from src.indexer.market_ingester import ensure_market
 from src.models import (
     Signal, Wallet, WalletCategoryScore, Market,
     WhalePosition, WhaleTrade,
@@ -25,7 +26,11 @@ async def generate_candidate(
     whale_price: float,
     event_type: str,
 ) -> int | None:
-    """Create or update a CANDIDATE signal. Returns signal ID if created/updated."""
+    """Create or update a CANDIDATE signal. Returns signal ID if created.
+
+    For ADD events on existing signals: updates the price but returns None
+    to suppress convergence re-evaluation (prevents duplicate paper trades).
+    """
 
     # Only OPEN and ADD events feed into convergence
     if event_type not in ("OPEN", "ADD"):
@@ -37,8 +42,8 @@ async def generate_candidate(
         if not wallet or wallet.copyability_class != "COPYABLE":
             return None
 
-        # Check market is in our universe
-        market = await session.get(Market, condition_id)
+        # Check market is in our universe (fetch on-demand if not in DB)
+        market = await ensure_market(condition_id, session)
         if not market:
             return None
 
@@ -46,18 +51,13 @@ async def generate_candidate(
         if category in ("other", "excluded", "ambiguous", None):
             return None
 
-        # Check time to resolution
-        min_hours = settings.get_min_hours_to_resolution(category)
+        # Compute time to resolution (informational, no longer a gate)
         if market.resolution_time:
             hours_left = (
                 market.resolution_time - datetime.now(timezone.utc)
             ).total_seconds() / 3600
-            if hours_left < min_hours:
-                logger.debug(
-                    "Skipping candidate: %s too close to resolution (%.1fh < %.1fh)",
-                    condition_id[:10], hours_left, min_hours,
-                )
-                return None
+            if market.resolved:
+                return None  # already resolved
         else:
             hours_left = None
 
@@ -72,7 +72,25 @@ async def generate_candidate(
         )
         cat_score = result.scalar_one_or_none()
 
-        # Check for existing candidate (idempotency)
+        # Per-category quality gate: whale must have proven edge in this category
+        if cat_score:
+            tc = cat_score.trade_count or 0
+            wr = float(cat_score.win_rate or 0)
+            pf = float(cat_score.profit_factor or 0)
+            if tc < settings.candidate_min_trade_count or wr < settings.candidate_min_win_rate or pf < settings.candidate_min_profit_factor:
+                logger.info(
+                    "  SKIP category_edge: %s has no edge in %s (trades=%d wr=%.2f pf=%.1f) for %s",
+                    wallet_address[:10], category, tc, wr, pf, condition_id[:10],
+                )
+                return None
+        else:
+            logger.info(
+                "  SKIP no_category_score: %s has no score for %s (%s)",
+                wallet_address[:10], category, condition_id[:10],
+            )
+            return None
+
+        # Check for existing candidate from this wallet on same market+outcome
         existing = await session.execute(
             select(Signal).where(
                 and_(
@@ -90,16 +108,17 @@ async def generate_candidate(
         expires_at = datetime.now(timezone.utc) + timedelta(hours=convergence_window)
 
         if existing_signal:
-            # Update existing candidate with new price (ADD event)
+            # ADD event on existing signal — update price but return None
+            # to suppress convergence re-evaluation (prevents duplicate trades)
             existing_signal.whale_avg_price = Decimal(str(whale_price))
             existing_signal.created_at = datetime.now(timezone.utc)
             existing_signal.expires_at = expires_at
             await session.commit()
             logger.info(
-                "Updated CANDIDATE signal %d for %s on %s",
+                "ADD reinforcement on signal %d for %s on %s (price updated, no re-convergence)",
                 existing_signal.id, wallet_address[:10], condition_id[:10],
             )
-            return existing_signal.id
+            return None  # Suppress re-convergence
 
         # Create new candidate
         signal = Signal(

@@ -5,6 +5,23 @@ from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 
 
+@pytest.fixture(autouse=True)
+def safe_settings(monkeypatch):
+    """Override sensitive settings so tests never touch live credentials,
+    and normalize env-dependent values for deterministic test results."""
+    from src.config import settings
+    # Redact secrets
+    monkeypatch.setattr(settings, "polymarket_private_key", "")
+    monkeypatch.setattr(settings, "polymarket_api_key", "test_key")
+    monkeypatch.setattr(settings, "polymarket_api_secret", "test_secret")
+    monkeypatch.setattr(settings, "polymarket_api_passphrase", "test_pass")
+    monkeypatch.setattr(settings, "telegram_bot_token", "")
+    monkeypatch.setattr(settings, "live_execution_enabled", False)
+    # Normalize env-dependent values to code defaults
+    monkeypatch.setattr(settings, "starting_capital", 15_000.0)
+    monkeypatch.setattr(settings, "max_total_exposure_pct", 0.15)
+
+
 @pytest.fixture
 def sample_wallet():
     return {
@@ -59,13 +76,18 @@ def sample_trades():
 
 @pytest.fixture
 def sample_category_metrics():
+    recent = datetime.now(timezone.utc)
     return {
-        "macro": {
-            "win_rate": 0.62,
-            "profit_factor": 2.1,
-            "trade_count": 55,
+        "weather": {
+            "win_rate": 0.85,
+            "profit_factor": 3.2,
+            "trade_count": 40,
             "followability": 0.68,
             "expectancy": 12.5,
+            "wins": 34,
+            "losses": 6,
+            "category_pnl": 5000,
+            "last_trade_ts": recent,
         },
         "crypto_weekly": {
             "win_rate": 0.51,
@@ -73,5 +95,9 @@ def sample_category_metrics():
             "trade_count": 30,
             "followability": 0.45,
             "expectancy": 3.2,
+            "wins": 15,
+            "losses": 15,
+            "category_pnl": 5000,
+            "last_trade_ts": recent,
         },
     }

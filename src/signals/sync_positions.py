@@ -524,6 +524,8 @@ async def sync_whale_positions_once() -> int:
                             allow_new_buys=allow_new_buys,
                         ) or "unknown"
                         counts[code] = counts.get(code, 0) + 1
+                        if code == "BUY":
+                            orders_placed += 1
                         await session.commit()
                     except Exception as e:
                         counts["error"] = counts.get("error", 0) + 1

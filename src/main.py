@@ -13,7 +13,38 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+
+async def ensure_vpn() -> bool:
+    """Connect NordVPN to Montreal if not already connected. Returns True on success."""
+    proc = await asyncio.create_subprocess_exec(
+        "nordvpn", "status",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    status = stdout.decode()
+
+    if "Connected" in status:
+        logger.info("NordVPN already connected")
+        return True
+
+    logger.info("Connecting NordVPN to Montreal...")
+    proc = await asyncio.create_subprocess_exec(
+        "nordvpn", "connect", "Canada", "Montreal",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    output = stdout.decode() + stderr.decode()
+
+    if proc.returncode == 0 and "You are connected" in output:
+        logger.info("NordVPN connected: %s", output.strip())
+        await asyncio.sleep(2)  # let routing settle
+        return True
+
+    logger.error("NordVPN connection failed: %s", output.strip())
+    return False
 
 
 async def startup_checks() -> bool:
@@ -22,18 +53,85 @@ async def startup_checks() -> bool:
 
     logger.info("Running startup checks...")
 
-    # Geoblock check — always run at startup
+    # Geoblock check — connect VPN if blocked
     blocked = await check_geoblock()
     if blocked:
-        logger.error("STARTUP HALTED: Polymarket access is geoblocked from this IP")
-        try:
-            from src.monitoring.telegram import send_alert
-            await send_alert("STARTUP HALTED: Geoblocked from Polymarket")
-        except Exception:
-            pass
-        return False
+        logger.warning("Geoblocked — attempting NordVPN connect...")
+        if not await ensure_vpn():
+            logger.error("STARTUP HALTED: VPN connection failed")
+            return False
+        # Recheck after VPN
+        blocked = await check_geoblock()
+        if blocked:
+            logger.error("STARTUP HALTED: Still geoblocked after VPN connect")
+            try:
+                from src.monitoring.telegram import send_alert
+                await send_alert("STARTUP HALTED: Geoblocked even after VPN")
+            except Exception:
+                pass
+            return False
 
     logger.info("Startup checks passed")
+
+    # Live execution validation
+    if settings.live_execution_enabled:
+        logger.info("Live execution is ENABLED — validating CLOB credentials...")
+        live_ok = await _validate_live_execution()
+        if not live_ok:
+            logger.warning(
+                "Live execution validation FAILED — falling back to PAPER mode"
+            )
+            settings.live_execution_enabled = False
+            try:
+                from src.monitoring.telegram import send_alert
+                await send_alert(
+                    "WARNING: Live execution validation failed at startup. "
+                    "Bot is running in PAPER mode."
+                )
+            except Exception:
+                pass
+    else:
+        logger.info("Live execution is DISABLED — running in paper mode")
+
+    return True
+
+
+async def _validate_live_execution() -> bool:
+    """Validate live execution prerequisites. Returns True if all checks pass."""
+    from src.polymarket.clob_auth import get_auth_client
+
+    # Check private key is set
+    if not settings.polymarket_private_key:
+        logger.error("POLYMARKET_PRIVATE_KEY is not set in .env")
+        return False
+
+    auth_client = get_auth_client()
+
+    # Test CLOB connectivity
+    logger.info("  Testing CLOB connectivity...")
+    connected = await auth_client.test_connectivity()
+    if not connected:
+        logger.error("  CLOB connectivity test failed")
+        return False
+    logger.info("  CLOB connectivity: OK")
+
+    # Check USDC balance and cache it for all modules
+    logger.info("  Checking USDC balance...")
+    try:
+        balance = await auth_client.get_balance()
+        logger.info("  USDC balance: $%.2f", balance)
+        from src.events import update_cached_balance
+        await update_cached_balance(balance)
+        if balance < 1.0:
+            logger.warning(
+                "  USDC balance is very low ($%.2f) — orders may fail",
+                balance,
+            )
+    except Exception as e:
+        logger.error("  Balance check failed: %s", e)
+        return False
+
+    logger.info("  Live execution validation passed (balance=$%.2f)", balance)
     return True
 
 
@@ -44,35 +142,31 @@ async def run_bot():
 
     scheduler = AsyncIOScheduler()
 
-    # Market ingestion — every 15 minutes
-    from src.indexer.market_ingester import ingest_markets
-    scheduler.add_job(ingest_markets, "interval", minutes=settings.market_refresh_interval_minutes, id="market_ingest")
-
-    # Wallet rescoring — every 6 hours
-    from src.scorer.wallet_scorer import score_all_wallets
-    scheduler.add_job(score_all_wallets, "interval", hours=settings.wallet_rescore_interval_hours, id="wallet_rescore")
-
-    # Signal expiry — every 5 minutes
-    from src.signals.signal_manager import expire_stale_signals
-    scheduler.add_job(expire_stale_signals, "interval", minutes=5, id="signal_expiry")
+    # Market refresh — lightweight update of tracked markets (on-demand fetch handles new ones)
+    from src.indexer.market_ingester import refresh_tracked_markets
+    scheduler.add_job(refresh_tracked_markets, "interval", minutes=settings.market_refresh_interval_minutes, id="market_refresh", coalesce=True, misfire_grace_time=300)
 
     # Resolution tracking — every 15 minutes
-    from src.tracking.resolution import check_resolutions
+    from src.tracking.resolution import check_resolutions, redeem_all_resolved
     scheduler.add_job(check_resolutions, "interval", minutes=15, id="resolution_check")
+
+    # Redeem all resolved positions (wins + losses) — every 30 minutes
+    scheduler.add_job(redeem_all_resolved, "interval", minutes=30, id="redemption_sweep")
+
+    # Reconcile DB against Polymarket wallet — every 15 minutes
+    from src.execution.reconcile import reconcile_positions as reconcile_job
+    scheduler.add_job(reconcile_job, "interval", minutes=15, id="reconcile")
 
     # Daily snapshot — once per day at 23:55 UTC
     from src.tracking.snapshots import take_daily_snapshot
     scheduler.add_job(take_daily_snapshot, "cron", hour=23, minute=55, id="daily_snapshot")
-
-    # Whale discovery — every 24 hours, scan category leaderboards for new whales
-    from src.indexer.whale_discovery import discover_and_ingest
-    scheduler.add_job(discover_and_ingest, "interval", hours=24, id="whale_discovery")
 
     # Daily Telegram summary — 10pm UTC
     async def daily_summary():
         try:
             from src.tracking.pnl import get_portfolio_pnl
             from src.monitoring.telegram import send_alert
+            from src.db import async_session
             from sqlalchemy import select, func
             pnl = await get_portfolio_pnl()
             async with async_session() as session:
@@ -107,32 +201,68 @@ async def run_bot():
 
     scheduler.start()
 
-    # Initial data load
-    logger.info("Running initial market ingestion...")
+    # Ensure LAN access to dashboard port through NordVPN firewall
     try:
-        await ingest_markets()
-    except Exception as e:
-        logger.error("Initial market ingestion failed: %s", e)
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "iptables", "-C", "INPUT", "-p", "tcp", "--dport", "8080",
+            "-s", "192.168.0.0/16", "-j", "ACCEPT",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.communicate()
+        if proc.returncode != 0:
+            proc = await asyncio.create_subprocess_exec(
+                "sudo", "iptables", "-I", "INPUT", "-p", "tcp", "--dport", "8080",
+                "-s", "192.168.0.0/16", "-j", "ACCEPT",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.communicate()
+    except Exception:
+        pass
 
-    # Start trade monitor
-    from src.signals.trade_monitor import run_trade_monitor
-    monitor_task = asyncio.create_task(run_trade_monitor(interval_seconds=30))
-
-    # Start price snapshot processor (for real followability)
-    from src.tracking.price_snapshots import run_snapshot_processor, recompute_followability_from_snapshots
-    snapshot_task = asyncio.create_task(run_snapshot_processor(interval_seconds=30))
-
-    # Recompute followability from real snapshots — every 6 hours (alongside wallet rescoring)
-    scheduler.add_job(recompute_followability_from_snapshots, "interval", hours=6, id="followability_recompute")
-
-    # Start WebSocket (Phase 2)
-    ws_task = None
+    # Start web dashboard early so it is available while the copy loop runs.
+    dashboard_runner = None
+    dashboard_site = None
     try:
-        from src.polymarket.websocket import MarketWebSocket
-        ws = MarketWebSocket()
-        ws_task = asyncio.create_task(ws.connect())
+        from aiohttp import web as _web
+        from src.monitoring.web_dashboard import handle_dashboard
+        dash_app = _web.Application()
+        dash_app.router.add_get("/", handle_dashboard)
+        dashboard_runner = _web.AppRunner(dash_app, access_log=None)
+        await dashboard_runner.setup()
+        dashboard_site = _web.TCPSite(dashboard_runner, "0.0.0.0", 8080)
+        await dashboard_site.start()
+        logger.info("Web dashboard running on http://0.0.0.0:8080")
     except Exception as e:
-        logger.warning("WebSocket startup failed (non-fatal): %s", e)
+        logger.warning("Web dashboard startup failed (non-fatal): %s", e)
+
+    # Seed the watch_whales into the DB + pull recent trades
+    from src.indexer.wallet_ingester import ingest_wallet
+    for addr in settings.watch_whales:
+        try:
+            new = await ingest_wallet(addr.lower())
+            logger.info("Seeded watch whale %s (+%d trades)", addr[:12], new)
+        except Exception as e:
+            logger.warning("Failed to seed watch whale %s: %s", addr[:12], e)
+
+    # Redeem resolved positions on-chain (burn losses, collect wins)
+    from src.tracking.resolution import redeem_all_resolved
+    try:
+        redeemed = await redeem_all_resolved()
+        logger.info("Startup redemption: %d markets redeemed", redeemed)
+    except Exception as e:
+        logger.error("Startup redemption failed: %s", e)
+
+    # Step 3: Reconcile DB with clean wallet state
+    from src.execution.reconcile import reconcile_positions
+    try:
+        recon = await reconcile_positions()
+        logger.info("Position reconciliation: %s", recon)
+    except Exception as e:
+        logger.error("Position reconciliation failed: %s", e)
+
+    # Start unified sync loop — detects new whale trades + tops up to target in one pass, every 30s.
+    from src.signals.sync_positions import run_sync_loop
+    monitor_task = asyncio.create_task(run_sync_loop(interval_seconds=30))
 
     # Start Telegram bot if configured
     telegram_task = None
@@ -147,11 +277,31 @@ async def run_bot():
 
     logger.info("Whale bot is running. Press Ctrl+C to stop.")
 
+    # Keep-alive: run forever, restart the monitor if it dies
+    tasks = {"monitor": monitor_task}
+
     try:
-        await asyncio.gather(monitor_task, return_exceptions=True)
-    except KeyboardInterrupt:
+        while True:
+            done, _ = await asyncio.wait(
+                tasks.values(),
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=60,
+            )
+            for task in done:
+                name = next(k for k, v in tasks.items() if v is task)
+                exc = task.exception() if not task.cancelled() else None
+                if exc:
+                    logger.error("Task '%s' crashed: %s — restarting in 5s", name, exc)
+                else:
+                    logger.warning("Task '%s' exited unexpectedly — restarting in 5s", name)
+                await asyncio.sleep(5)
+                if name == "monitor":
+                    tasks[name] = asyncio.create_task(run_sync_loop(interval_seconds=30))
+    except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Shutting down...")
     finally:
+        if dashboard_runner:
+            await dashboard_runner.cleanup()
         scheduler.shutdown()
 
 

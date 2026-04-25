@@ -11,7 +11,7 @@ class TestRiskConfig:
         assert settings.max_total_exposure_pct == 0.15
 
     def test_max_same_category(self):
-        assert settings.max_same_category_positions == 3
+        assert settings.max_same_category_positions == 6
 
     def test_daily_loss_halt(self):
         assert settings.daily_loss_halt_pct == 0.05

@@ -36,6 +36,7 @@ class Wallet(Base):
         TIMESTAMP(timezone=True), default=utcnow
     )
     last_active: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    last_ingested_ts: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     last_scored: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     total_trades: Mapped[int] = mapped_column(Integer, default=0)
     total_pnl_usdc: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=0)
@@ -48,6 +49,9 @@ class Wallet(Base):
     trades_per_month: Mapped[Decimal | None] = mapped_column(Numeric(8, 2))
     median_hold_hours: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
     pct_held_to_resolution: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
+    discovery_win_rate: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    discovery_profit_factor: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    specialization_ratio: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
     meta: Mapped[dict] = mapped_column(JSONB, default=dict)
 
     category_scores: Mapped[list["WalletCategoryScore"]] = relationship(
@@ -80,7 +84,7 @@ class WalletCategoryScore(Base):
     win_rate: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
     profit_factor: Mapped[Decimal | None] = mapped_column(Numeric(8, 2))
     gain_loss_ratio: Mapped[Decimal | None] = mapped_column(Numeric(8, 2))
-    expectancy: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    expectancy: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     trade_count: Mapped[int | None] = mapped_column(Integer)
     avg_hold_hours: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
 
@@ -92,6 +96,8 @@ class WalletCategoryScore(Base):
     followability_provisional: Mapped[bool] = mapped_column(Boolean, default=True)
 
     avg_position_pct: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
+    category_pnl: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=0)
+    qualifying: Mapped[bool] = mapped_column(Boolean, default=False)
     last_updated: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
 
     wallet: Mapped["Wallet"] = relationship(back_populates="category_scores")
@@ -113,6 +119,8 @@ class Market(Base):
     outcome: Mapped[str | None] = mapped_column(Text)
     tags: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
     volume_usdc: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    liquidity_usdc: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    volume_24hr_usdc: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     created_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     last_updated: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), default=utcnow
@@ -193,13 +201,14 @@ class WhalePosition(Base):
         Text, ForeignKey("markets.condition_id", ondelete="CASCADE"), primary_key=True
     )
     outcome: Mapped[str] = mapped_column(Text, primary_key=True)
-    avg_entry_price: Mapped[Decimal | None] = mapped_column(Numeric(8, 6))
+    avg_entry_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 6))
     total_size_usdc: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     num_contracts: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     first_entry: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     last_updated: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     is_open: Mapped[bool] = mapped_column(Boolean, default=True)
     last_event_type: Mapped[str | None] = mapped_column(Text)
+    slug: Mapped[str | None] = mapped_column(Text)
 
     wallet: Mapped["Wallet"] = relationship(back_populates="positions")
 
@@ -279,7 +288,7 @@ class MyTrade(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "fill_status IN ('PAPER', 'PENDING', 'PARTIAL', 'FILLED', 'CANCELLED')",
+            "fill_status IN ('PAPER', 'PENDING', 'PARTIAL', 'FILLED', 'CANCELLED', 'FAILED')",
             name="ck_my_trades_fill_status",
         ),
     )
@@ -297,5 +306,5 @@ class PortfolioSnapshot(Base):
     win_count_30d: Mapped[int | None] = mapped_column(Integer)
     loss_count_30d: Mapped[int | None] = mapped_column(Integer)
     profit_factor_30d: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
-    expectancy_30d: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    expectancy_30d: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     max_drawdown_30d: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))

@@ -41,6 +41,8 @@ class GammaMarket(BaseModel):
     closed: bool = False
     tags: list[dict] = Field(default_factory=list)
     volume: str = "0"
+    liquidity_num: float = Field(default=0.0, alias="liquidityNum")
+    volume_24hr: float = Field(default=0.0, alias="volume24hr")
     created_at: str = Field(default="", alias="createdAt")
     accepting_orders: bool = Field(default=True, alias="acceptingOrders")
     neg_risk: bool = Field(default=False, alias="negRisk")
@@ -48,8 +50,17 @@ class GammaMarket(BaseModel):
     neg_risk_request_id: str = Field(default="", alias="negRiskRequestId")
     description: str = ""
     game_start_time: str = Field(default="", alias="gameStartTime")
+    events: list[dict] = Field(default_factory=list)
 
     model_config = {"populate_by_name": True, "coerce_numbers_to_str": True}
+
+    def get_event_category(self) -> str | None:
+        """Extract category from the nested event object (Polymarket's own classification)."""
+        for event in self.events:
+            cat = event.get("category", "")
+            if cat:
+                return cat
+        return None
 
     def get_token_ids(self) -> list[str]:
         if isinstance(self.clob_token_ids, list):
@@ -114,15 +125,25 @@ class GammaAPIClient:
                         logger.warning("Rate limited on %s, waiting %ds", endpoint, wait)
                         await asyncio.sleep(wait)
                         continue
+                    if resp.status == 422:
+                        # Permanent error — market removed/gone, don't retry
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info, resp.history,
+                            status=422, message="Unprocessable Entity",
+                        )
                     resp.raise_for_status()
                     data = await resp.json()
 
-                    if endpoint not in self._logged_endpoints:
+                    from src.config import settings as _settings
+                    if _settings.log_level == "DEBUG" and endpoint not in self._logged_endpoints:
                         self._logged_endpoints.add(endpoint)
                         self._log_raw_response(endpoint, data)
 
                     return data
             except aiohttp.ClientError as e:
+                if "422" in str(e) or "Unprocessable" in str(e):
+                    logger.debug("Market gone (422): %s", endpoint)
+                    raise
                 if attempt == 2:
                     logger.error("Failed to fetch %s after 3 attempts: %s", endpoint, e)
                     raise
@@ -177,20 +198,41 @@ class GammaAPIClient:
         logger.info("Fetched %d active markets from Gamma API", len(all_markets))
         return all_markets
 
-    async def get_market(self, condition_id: str) -> GammaMarket | None:
-        """Fetch a single market by condition_id."""
+    async def get_market(self, condition_id: str, slug: str | None = None) -> GammaMarket | None:
+        """Fetch a single market by slug (preferred) or condition_id fallback.
+
+        The Gamma path-based endpoint ``/markets/{id}`` expects a numeric ID,
+        NOT a condition_id hex hash, so we always use query-param endpoints.
+        """
         # Try cache first
         cache_key = f"gamma:market:{condition_id}"
         cached = await cache_get(cache_key)
         if cached:
             return GammaMarket.model_validate(cached)
 
-        data = await self._request(f"markets/{condition_id}")
+        data = None
+
+        # Strategy 1: slug-based lookup (most reliable)
+        if slug:
+            try:
+                data = await self._request("markets", {"slug": slug})
+            except Exception as e:
+                logger.debug("Gamma slug lookup failed for %s: %s", slug, e)
+
+        # Strategy 2: condition_id query param fallback
+        if not data or (isinstance(data, list) and not data):
+            try:
+                data = await self._request("markets", {"condition_id": condition_id})
+            except Exception as e:
+                logger.debug("Gamma condition_id lookup failed for %s: %s", condition_id[:10], e)
+
         if not data:
             return None
 
         if isinstance(data, list) and data:
             data = data[0]
+        elif isinstance(data, list) and not data:
+            return None
         elif isinstance(data, dict) and "markets" in data:
             markets = data["markets"]
             if markets:
@@ -199,6 +241,16 @@ class GammaAPIClient:
         market = GammaMarket.model_validate(data)
         await cache_set(cache_key, data, ex=900)  # cache 15 min
         return market
+
+    async def get_event_tags(self, event_id: str) -> list[str]:
+        """Fetch tag labels from an event by numeric ID."""
+        try:
+            data = await self._request(f"events/{event_id}")
+            if isinstance(data, dict):
+                return [t.get("label", "") for t in data.get("tags", []) if t.get("label")]
+        except Exception as e:
+            logger.debug("Failed to fetch event %s tags: %s", event_id, e)
+        return []
 
     async def get_market_by_slug(self, slug: str) -> GammaMarket | None:
         data = await self._request("markets", {"slug": slug})

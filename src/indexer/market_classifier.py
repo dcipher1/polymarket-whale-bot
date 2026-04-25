@@ -1,10 +1,63 @@
-"""Market category classification using tags and keyword matching."""
+"""Market category classification using Polymarket event categories + keyword fallback."""
 
 import logging
 import re
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
+
+# Polymarket event category → our internal category
+# Case-insensitive lookup (keys are lowercased at match time)
+POLYMARKET_CATEGORY_MAP: dict[str, str] = {
+    # Broad categories
+    "politics": "politics",
+    "us-current-affairs": "politics",
+    "geopolitics": "geopolitics",
+    "world": "geopolitics",
+    "crypto": "crypto_weekly",  # refined to crypto_monthly by keyword check
+    "finance": "macro",
+    "economy": "macro",
+    "business": "macro",
+    "stocks": "macro",
+    "ipos": "macro",
+    "sports": "sports",
+    "tech": "tech",
+    "weather": "weather",
+    "culture": "culture",
+    "pop culture": "culture",
+    "entertainment": "culture",
+    # Event-level tags from Polymarket
+    "commodities": "macro",
+    "oil": "macro",
+    "ipo": "macro",
+    "ipos": "macro",
+    "big tech": "macro",
+    "bonds": "macro",
+    "treasury": "macro",
+    "forex": "macro",
+    "gold": "macro",
+    "silver": "macro",
+    "russia": "geopolitics",
+    "ukraine": "geopolitics",
+    "china": "geopolitics",
+    "nato": "geopolitics",
+    "eu": "geopolitics",
+    "india": "geopolitics",
+    "iran": "geopolitics",
+    "israel": "geopolitics",
+    "greenland": "geopolitics",
+    "france": "politics",
+    "uk": "politics",
+    "england": "politics",
+    "elon musk": "macro",
+    "bitcoin": "crypto_weekly",
+    "ethereum": "crypto_weekly",
+    "solana": "crypto_weekly",
+    "microstrategy": "crypto_monthly",
+    "exchange": "crypto_weekly",
+    "defi": "crypto_weekly",
+    "nft": "crypto_weekly",
+}
 
 CATEGORY_RULES: dict[str, dict] = {
     "macro": {
@@ -56,6 +109,10 @@ CATEGORY_RULES: dict[str, dict] = {
             "iran", "ukraine", "russia", "china", "ceasefire", "strike",
             "sanctions", "invasion", "regime", "strait of hormuz",
             "nato", "tariff", "trade war", "coup",
+            "north korea", "taiwan", "south china sea",
+            "houthi", "hezbollah", "hamas", "gaza",
+            "nuclear", "missile", "military", "peace deal",
+            "un security council", "brics", "opec",
         ],
     },
 }
@@ -102,8 +159,12 @@ def classify_market(
     question: str,
     tags: list[str] | None = None,
     category_override: str | None = None,
+    polymarket_category: str | None = None,
 ) -> ClassificationResult:
-    """Classify a market into a category based on question text and tags."""
+    """Classify a market into a category.
+
+    Priority: manual override > Polymarket event category > keyword fallback.
+    """
 
     if category_override:
         return ClassificationResult(
@@ -114,12 +175,13 @@ def classify_market(
     question_lower = question.lower()
     tag_labels = [t.lower() for t in (tags or [])]
 
-    # Check for sports — override any other classification
+    # Check for sports — classify as sports instead of falling through to other rules
     for pattern in SPORTS_PATTERNS:
         if re.search(pattern, question, re.IGNORECASE):
-            return ClassificationResult(category="other")
+            return ClassificationResult(category="sports")
 
-    # Check for excluded ultra-short crypto
+    # Check for excluded ultra-short crypto (before Polymarket category, so 5-min
+    # crypto markets don't slip through as crypto_weekly)
     for pattern in EXCLUDED_PATTERNS:
         if re.search(pattern, question_lower):
             has_crypto = any(
@@ -129,6 +191,51 @@ def classify_market(
             if has_crypto:
                 return ClassificationResult(category="excluded")
 
+    # Primary: use Polymarket's own event category if available
+    if polymarket_category:
+        mapped = POLYMARKET_CATEGORY_MAP.get(polymarket_category.lower())
+        if mapped:
+            # For crypto, refine weekly vs monthly using keywords
+            if mapped == "crypto_weekly":
+                monthly_kws = CATEGORY_RULES.get("crypto_monthly", {}).get("keywords", [])
+                if any(kw in question_lower for kw in monthly_kws):
+                    mapped = "crypto_monthly"
+            return ClassificationResult(
+                category=mapped,
+                source="polymarket_event",
+                matched_tags=[polymarket_category],
+            )
+
+    # Secondary: check event-level tags against our category map
+    # Polymarket puts rich tags on events (e.g. "Commodities", "Oil", "Finance")
+    if tag_labels:
+        tag_matches = []
+        for tag in tag_labels:
+            mapped = POLYMARKET_CATEGORY_MAP.get(tag.lower())
+            if mapped and mapped != "other":
+                tag_matches.append((tag, mapped))
+        if tag_matches:
+            unique_cats = set(cat for _, cat in tag_matches)
+            if len(unique_cats) == 1:
+                best_cat = unique_cats.pop()
+                if best_cat == "crypto_weekly":
+                    monthly_kws = CATEGORY_RULES.get("crypto_monthly", {}).get("keywords", [])
+                    if any(kw in question_lower for kw in monthly_kws):
+                        best_cat = "crypto_monthly"
+                return ClassificationResult(
+                    category=best_cat,
+                    source="polymarket_tag",
+                    matched_tags=[t for t, _ in tag_matches],
+                )
+            else:
+                return ClassificationResult(
+                    category="ambiguous",
+                    source="polymarket_tag_ambiguous",
+                    matched_tags=[t for t, _ in tag_matches],
+                    all_matched_categories=list(unique_cats),
+                )
+
+    # Fallback: keyword/tag matching
     matched_categories: dict[str, ClassificationResult] = {}
 
     for category, rules in CATEGORY_RULES.items():

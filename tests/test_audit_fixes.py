@@ -4,6 +4,7 @@ from decimal import Decimal
 import pytest
 
 from src.execution.reconcile import _apply_resolved_position_to_trades
+from src.config import settings
 from src.models import MyTrade
 from src.signals import sync_positions
 from src.tracking.resolution import apply_resolution_to_trade
@@ -120,3 +121,11 @@ def test_reconcile_distributes_pnl_and_marks_cancelled_unfilled():
     assert cancelled.trade_outcome == "UNFILLED"
     assert cancelled.pnl_usdc == Decimal("0")
     assert cancelled.exit_price is None
+
+
+def test_runtime_strategy_is_fixed_three_wallet_weather_copying():
+    assert len(settings.watch_whales) == 3
+    assert settings.valid_categories == {"weather"}
+    assert settings.position_size_fraction == 1.0
+    assert settings.fixed_position_size_usdc == 50
+    assert sync_positions.MAX_ORDER_USDC == 50.0

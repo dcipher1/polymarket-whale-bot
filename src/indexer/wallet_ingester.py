@@ -16,39 +16,91 @@ from src.polymarket.data_api import DataAPIClient, Trade, Activity
 logger = logging.getLogger(__name__)
 
 
-async def ingest_wallet(address: str, full_backfill: bool = False) -> int:
-    """Ingest all trades for a wallet. Returns count of new trades."""
-    client = DataAPIClient()
+async def ingest_wallet(
+    address: str,
+    full_backfill: bool = False,
+    client: DataAPIClient | None = None,
+) -> int:
+    """Ingest all trades for a wallet. Returns count of new trades.
+
+    Args:
+        address: Wallet address to ingest.
+        full_backfill: If True, fetch all trades regardless of last timestamp.
+        client: Shared DataAPIClient instance. If None, creates a new one.
+    """
+    owns_client = client is None
+    if owns_client:
+        client = DataAPIClient()
     try:
         async with async_session() as session:
             # Ensure wallet exists
             await _ensure_wallet(session, address)
 
-            # Fetch trades
-            trades = await client.get_all_trades(address)
-            logger.info("Fetched %d trades for wallet %s", len(trades), address[:10])
+            # Get last ingested timestamp for incremental fetch
+            since_ts = None
+            if not full_backfill:
+                wallet = await session.get(Wallet, address)
+                if wallet and wallet.last_ingested_ts:
+                    since_ts = wallet.last_ingested_ts
+
+            # Fetch trades via activity API (more complete than trades endpoint)
+            # In incremental mode, stop paginating once we hit already-seen trades
+            if since_ts:
+                since_epoch = int(since_ts.timestamp())
+                all_activity = []
+                offset = 0
+                for _ in range(30):
+                    try:
+                        batch = await client.get_activity(address, limit=100, offset=offset)
+                    except Exception:
+                        break
+                    if not batch:
+                        break
+                    all_activity.extend(batch)
+                    # Activity is newest-first; stop if oldest in batch is before cutoff
+                    oldest_ts = min((int(float(a.timestamp or 0)) for a in batch if a.timestamp), default=0)
+                    if oldest_ts and oldest_ts < since_epoch:
+                        break
+                    if len(batch) < 100:
+                        break
+                    offset += 100
+            else:
+                all_activity = await client.get_all_activity(address)
+
+            trades = [a for a in all_activity if a.type == "TRADE"]
 
             new_count = 0
+            latest_ts = since_ts
             for trade in trades:
                 inserted = await _upsert_trade(session, address, trade)
                 if inserted:
                     new_count += 1
 
-            # Fetch activity for redemptions
-            activity = await client.get_all_activity(address)
-            logger.info("Fetched %d activity records for wallet %s", len(activity), address[:10])
+                # Track latest trade timestamp for next incremental fetch
+                ts = _parse_timestamp(trade)
+                if ts and (latest_ts is None or ts > latest_ts):
+                    latest_ts = ts
 
-            # Update wallet stats
-            await _update_wallet_stats(session, address)
+            # Update wallet stats and last_ingested_ts
+            # Always advance to now so incremental polls don't re-fetch
+            update_ts = datetime.now(timezone.utc) if since_ts else latest_ts
+            await _update_wallet_stats(session, address, update_ts)
             await session.commit()
 
-            logger.info(
-                "Ingested wallet %s: %d new trades out of %d total",
-                address[:10], new_count, len(trades),
-            )
+            if new_count > 0:
+                logger.info(
+                    "Fetched %d new trades for wallet %s (%d checked)",
+                    new_count, address[:10], len(trades),
+                )
+            elif not since_ts:
+                logger.info(
+                    "Fetched %d trades for wallet %s (full)",
+                    len(trades), address[:10],
+                )
             return new_count
     finally:
-        await client.close()
+        if owns_client:
+            await client.close()
 
 
 async def _ensure_wallet(session: AsyncSession, address: str) -> None:
@@ -60,19 +112,36 @@ async def _ensure_wallet(session: AsyncSession, address: str) -> None:
     await session.flush()
 
 
-async def _upsert_trade(session: AsyncSession, wallet_address: str, trade: Trade) -> bool:
+def _parse_timestamp(trade: Trade | Activity) -> datetime | None:
+    """Parse timestamp from a trade or activity object."""
+    ts_str = trade.timestamp or getattr(trade, "match_time", "") or getattr(trade, "last_update", "")
+    if not ts_str:
+        return None
+    try:
+        ts_val = int(float(ts_str))
+        if ts_val > 1_000_000_000:
+            return datetime.fromtimestamp(ts_val, tz=timezone.utc)
+    except (ValueError, TypeError):
+        pass
+    try:
+        return datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+async def _upsert_trade(session: AsyncSession, wallet_address: str, trade: Trade | Activity) -> bool:
     """Insert a trade if not duplicate. Returns True if new."""
-    # Parse trade data
-    tx_hash = trade.transaction_hash or trade.id
+    # Parse trade data — handle both Trade and Activity models
+    tx_hash = getattr(trade, "transaction_hash", "") or trade.id
     if not tx_hash:
         return False
 
-    token_id = trade.asset or trade.asset_id
+    token_id = getattr(trade, "asset", "") or getattr(trade, "asset_id", "") or getattr(trade, "token_id", "")
     if not token_id:
         return False
 
     # Determine side
-    side = trade.side.upper() if trade.side else trade.trader_side.upper()
+    side = trade.side.upper() if trade.side else getattr(trade, "trader_side", "").upper()
     if side not in ("BUY", "SELL"):
         return False
 
@@ -82,7 +151,7 @@ async def _upsert_trade(session: AsyncSession, wallet_address: str, trade: Trade
         outcome = outcome_raw
     else:
         # Map by outcomeIndex: 0=YES, 1=NO (Polymarket convention)
-        outcome = "YES" if trade.outcome_index == 0 else "NO"
+        outcome = "YES" if getattr(trade, "outcome_index", 0) == 0 else "NO"
 
     try:
         price = Decimal(str(trade.price))
@@ -90,35 +159,13 @@ async def _upsert_trade(session: AsyncSession, wallet_address: str, trade: Trade
     except Exception:
         return False
 
-    size_usdc = price * size  # approximate
+    size_usdc = price * size  # cost basis
 
-    # Parse timestamp — can be unix epoch or ISO string
-    timestamp = None
-    ts_str = trade.timestamp or trade.match_time or trade.last_update
-    if ts_str:
-        try:
-            ts_val = int(float(ts_str))
-            if ts_val > 1_000_000_000:
-                timestamp = datetime.fromtimestamp(ts_val, tz=timezone.utc)
-        except (ValueError, TypeError):
-            pass
-        if not timestamp:
-            try:
-                timestamp = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
-            except (ValueError, TypeError):
-                pass
-    if not timestamp:
-        timestamp = datetime.now(timezone.utc)
+    # Parse timestamp
+    timestamp = _parse_timestamp(trade) or datetime.now(timezone.utc)
 
     # Determine condition_id
     condition_id = trade.condition_id or trade.market or ""
-
-    # Skip if market doesn't exist in our DB (FK constraint)
-    if condition_id:
-        from src.models import Market
-        market_exists = await session.get(Market, condition_id)
-        if not market_exists:
-            return False
 
     stmt = insert(WhaleTrade).values(
         wallet_address=wallet_address,
@@ -159,7 +206,11 @@ async def _upsert_trade(session: AsyncSession, wallet_address: str, trade: Trade
     return is_new
 
 
-async def _update_wallet_stats(session: AsyncSession, address: str) -> None:
+async def _update_wallet_stats(
+    session: AsyncSession,
+    address: str,
+    latest_ts: datetime | None = None,
+) -> None:
     """Update aggregate stats on the wallet record."""
     result = await session.execute(
         select(func.count(WhaleTrade.id)).where(WhaleTrade.wallet_address == address)
@@ -171,10 +222,9 @@ async def _update_wallet_stats(session: AsyncSession, address: str) -> None:
     )
     last_active = result.scalar()
 
-    await session.execute(
-        select(Wallet).where(Wallet.address == address)
-    )
     wallet = await session.get(Wallet, address)
     if wallet:
         wallet.total_trades = total_trades
         wallet.last_active = last_active
+        if latest_ts:
+            wallet.last_ingested_ts = latest_ts

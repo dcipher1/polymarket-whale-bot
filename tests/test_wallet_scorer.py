@@ -1,28 +1,10 @@
 """Tests for wallet scoring components."""
 
 from src.scorer.behavior import (
-    _frequency_score,
     _hold_duration_score,
     _resolution_holding_score,
-    _concentration_score,
 )
 from src.scorer.copyability import classify_copyability, compute_rank_score
-
-
-class TestFrequencyScore:
-    def test_low_frequency(self):
-        assert _frequency_score(10) == 100
-
-    def test_medium_frequency(self):
-        score = _frequency_score(35)
-        assert 70 < score < 100
-
-    def test_high_frequency(self):
-        score = _frequency_score(75)
-        assert 30 < score < 70
-
-    def test_bot_frequency(self):
-        assert _frequency_score(150) == 0
 
 
 class TestHoldDurationScore:
@@ -31,13 +13,15 @@ class TestHoldDurationScore:
 
     def test_medium_hold(self):
         score = _hold_duration_score(100)
-        assert 40 < score < 100
+        assert score == 100
 
     def test_short_hold(self):
-        assert _hold_duration_score(30) == 40
+        score = _hold_duration_score(30)
+        assert 50 < score < 60
 
     def test_daytrader(self):
-        assert _hold_duration_score(12) == 0
+        score = _hold_duration_score(12)
+        assert 20 < score < 40
 
 
 class TestResolutionHoldingScore:
@@ -52,68 +36,54 @@ class TestResolutionHoldingScore:
         assert _resolution_holding_score(0.30) == 20
 
 
-class TestConcentrationScore:
-    def test_high_concentration(self):
-        assert _concentration_score(0.08) == 100
-
-    def test_medium_concentration(self):
-        score = _concentration_score(0.035)
-        assert 0 < score < 100
-
-    def test_low_concentration(self):
-        assert _concentration_score(0.005) == 20
-
-
 class TestCopyabilityClassification:
     def test_copyable(self, sample_category_metrics):
         result, best_cat = classify_copyability(
             conviction_score=72,
-            total_pnl=75000,
-            trades_per_month=15,
             category_metrics=sample_category_metrics,
         )
         assert result == "COPYABLE"
-        assert best_cat == "macro"
+        assert best_cat == "weather"
 
     def test_watch(self):
         metrics = {
-            "macro": {
-                "win_rate": 0.53,
+            "weather": {
+                "win_rate": 0.66,
                 "profit_factor": 1.2,
                 "trade_count": 35,
                 "followability": 0.40,
+                "wins": 23,
+                "losses": 12,
+                "category_pnl": 5000,
             }
         }
         result, _ = classify_copyability(
             conviction_score=45,
-            total_pnl=15000,
-            trades_per_month=25,
             category_metrics=metrics,
         )
         assert result == "WATCH"
 
-    def test_reject_low_conviction(self):
+    def test_watch_low_conviction_high_stats(self):
         metrics = {
-            "macro": {
-                "win_rate": 0.60,
-                "profit_factor": 2.0,
+            "weather": {
+                "win_rate": 0.80,
+                "profit_factor": 3.0,
                 "trade_count": 60,
                 "followability": 0.70,
+                "wins": 48,
+                "losses": 12,
+                "category_pnl": 5000,
             }
         }
         result, _ = classify_copyability(
             conviction_score=30,
-            total_pnl=5000,
-            trades_per_month=200,
             category_metrics=metrics,
         )
-        assert result == "REJECT"
+        assert result == "WATCH"
 
     def test_reject_no_categories(self):
         result, _ = classify_copyability(
             conviction_score=80,
-            total_pnl=100000,
-            trades_per_month=10,
             category_metrics={},
         )
         assert result == "REJECT"

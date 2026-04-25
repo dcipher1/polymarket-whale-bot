@@ -20,9 +20,14 @@ MIN_CONCURRENT_TRADES = 5
 async def detect_clusters(session: AsyncSession) -> dict[str, str]:
     """Detect wallet clusters. Returns {wallet_address: cluster_id}."""
 
-    # Get all wallet addresses
-    result = await session.execute(select(Wallet.address))
+    # Only check COPYABLE + WATCH wallets for clustering
+    result = await session.execute(
+        select(Wallet.address).where(
+            Wallet.copyability_class.in_(["COPYABLE", "WATCH"])
+        )
+    )
     addresses = [r[0] for r in result.all()]
+    logger.info("Cluster detection: checking %d wallets", len(addresses))
 
     if len(addresses) < 2:
         return {}

@@ -34,7 +34,7 @@ class TestDataModels:
         }
         act = Activity.model_validate(data)
         assert act.condition_id == "cond123"
-        assert act.tx_hash == "0xhash"
+        assert act.transaction_hash == "0xhash"
 
     def test_trade_model(self):
         data = {

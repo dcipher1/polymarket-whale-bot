@@ -84,6 +84,11 @@ async def _build_position(
 
     is_open = total_contracts > 0
     avg_entry = (total_cost / total_contracts) if total_contracts > 0 else Decimal("0")
+    # Clamp avg_entry to valid price range (0-1 for prediction markets)
+    if avg_entry > Decimal("1"):
+        avg_entry = Decimal("1")
+    elif avg_entry < Decimal("0"):
+        avg_entry = Decimal("0")
     total_size_usdc = total_contracts * avg_entry
 
     stmt = insert(WhalePosition).values(

@@ -62,7 +62,7 @@ class TestMarketClassifier:
         assert result.source == "manual"
 
     def test_ambiguous_dual_match(self):
-        # A question that matches both politics and geopolitics
+        # Tags with multiple category matches → ambiguous
         result = classify_market(
             "Will sanctions against Russia lead to a vote in congress?",
             tags=["politics", "geopolitics"],

@@ -1,3 +1,4 @@
+# Shared infrastructure for the whale bot and the market-maker recorder/replay stack.
 services:
   postgres:
     image: postgres:16

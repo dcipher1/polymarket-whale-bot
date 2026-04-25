@@ -1,6 +1,6 @@
 """Tests for position sizing."""
 
-from src.execution.position_sizer import FixedSizer, KellySizer, get_sizer
+from src.execution.position_sizer import FixedSizer, KellySizer, ConvergenceScaledSizer, get_sizer
 from src.config import settings
 
 
@@ -45,6 +45,9 @@ class TestKellySizer:
 
 
 class TestSizerFactory:
-    def test_default_is_fixed(self):
+    def test_default_sizer(self):
         sizer = get_sizer()
-        assert isinstance(sizer, FixedSizer)
+        if settings.convergence_scale_enabled:
+            assert isinstance(sizer, ConvergenceScaledSizer)
+        else:
+            assert isinstance(sizer, FixedSizer)

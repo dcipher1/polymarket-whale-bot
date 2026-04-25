@@ -1,13 +1,16 @@
 """Performance metrics: win rate, profit factor, gain/loss ratio, expectancy."""
 
 import logging
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.models import WhaleTrade, WhalePosition, Market
+from src.config import settings
+from src.models import WhaleTrade, Market
 
 logger = logging.getLogger(__name__)
 
@@ -19,9 +22,12 @@ class PerformanceMetrics:
     gain_loss_ratio: float = 0.0
     expectancy: float = 0.0
     trade_count: int = 0
+    win_count: int = 0
+    loss_count: int = 0
     total_wins_usdc: float = 0.0
     total_losses_usdc: float = 0.0
     avg_hold_hours: float = 0.0
+    last_trade_ts: datetime | None = None
 
 
 async def compute_performance(
@@ -29,16 +35,23 @@ async def compute_performance(
     wallet_address: str,
     category: str | None = None,
 ) -> PerformanceMetrics:
-    """Compute performance metrics for a wallet, optionally filtered by category."""
+    """Compute performance metrics from whale_trades on resolved markets.
 
-    # Get all closed positions for this wallet
+    For each resolved market, computes true PnL from trade history:
+      PnL = sell_revenue + resolution_payout - buy_cost
+
+    This handles both hold-to-resolution and active trading (sell-for-profit).
+    """
+
+    # Get all trades on resolved markets
     query = (
-        select(WhalePosition, Market)
-        .join(Market, WhalePosition.condition_id == Market.condition_id)
+        select(WhaleTrade, Market)
+        .join(Market, WhaleTrade.condition_id == Market.condition_id)
         .where(
             and_(
-                WhalePosition.wallet_address == wallet_address,
-                WhalePosition.is_open == False,
+                WhaleTrade.wallet_address == wallet_address,
+                Market.resolved == True,
+                Market.outcome.isnot(None),
             )
         )
     )
@@ -51,16 +64,65 @@ async def compute_performance(
     if not rows:
         return PerformanceMetrics()
 
+    # Group trades by (condition_id, outcome) — each is a "market position"
+    # Key: (condition_id, outcome) → {buys, sells, market, timestamps}
+    positions: dict[tuple[str, str], dict] = defaultdict(lambda: {
+        "buy_cost": 0.0,
+        "buy_contracts": 0.0,
+        "sell_revenue": 0.0,
+        "sell_contracts": 0.0,
+        "market": None,
+        "first_ts": None,
+        "last_ts": None,
+    })
+
+    for trade, market in rows:
+        outcome = trade.outcome.upper()
+        key = (trade.condition_id, outcome)
+        pos = positions[key]
+        pos["market"] = market
+
+        price = float(trade.price or 0)
+        contracts = float(trade.num_contracts or 0)
+        ts = trade.timestamp
+
+        if trade.side == "BUY":
+            pos["buy_cost"] += price * contracts
+            pos["buy_contracts"] += contracts
+        elif trade.side == "SELL":
+            pos["sell_revenue"] += price * contracts
+            pos["sell_contracts"] += contracts
+
+        if pos["first_ts"] is None or ts < pos["first_ts"]:
+            pos["first_ts"] = ts
+        if pos["last_ts"] is None or ts > pos["last_ts"]:
+            pos["last_ts"] = ts
+
     wins = []
     losses = []
     hold_hours = []
+    latest_qualifying_ts = None
 
-    for position, market in rows:
-        if not market.resolved:
-            continue  # only count settled trades
+    for (cid, outcome), pos in positions.items():
+        market = pos["market"]
+        buy_contracts = pos["buy_contracts"]
+        if buy_contracts == 0:
+            continue  # sell-only (no initial position) — skip
 
-        # Determine P&L
-        pnl = _compute_position_pnl(position, market)
+        # Penny-pick filter: skip high-entry positions
+        avg_buy_price = pos["buy_cost"] / buy_contracts
+        if avg_buy_price > settings.max_entry_price_trade:
+            continue
+
+        # Track most recent qualifying trade
+        if pos["last_ts"] and (latest_qualifying_ts is None or pos["last_ts"] > latest_qualifying_ts):
+            latest_qualifying_ts = pos["last_ts"]
+
+        # Compute PnL: sell_revenue + resolution_payout - buy_cost
+        remaining = max(buy_contracts - pos["sell_contracts"], 0)
+        won = outcome == market.outcome.upper()
+        resolution_payout = remaining * (1.0 if won else 0.0)
+        pnl = pos["sell_revenue"] + resolution_payout - pos["buy_cost"]
 
         if pnl > 0:
             wins.append(pnl)
@@ -69,8 +131,8 @@ async def compute_performance(
         # pnl == 0 treated as neither
 
         # Hold duration
-        if position.first_entry and position.last_updated:
-            delta = position.last_updated - position.first_entry
+        if pos["first_ts"] and pos["last_ts"]:
+            delta = pos["last_ts"] - pos["first_ts"]
             hold_hours.append(delta.total_seconds() / 3600)
 
     total_trades = len(wins) + len(losses)
@@ -95,32 +157,10 @@ async def compute_performance(
         gain_loss_ratio=round(min(gain_loss_ratio, 9999), 2),
         expectancy=round(expectancy, 4),
         trade_count=total_trades,
+        win_count=len(wins),
+        loss_count=len(losses),
         total_wins_usdc=round(total_wins, 2),
         total_losses_usdc=round(total_losses, 2),
         avg_hold_hours=round(avg_hold, 2),
+        last_trade_ts=latest_qualifying_ts,
     )
-
-
-def _compute_position_pnl(position: WhalePosition, market: Market) -> float:
-    """Compute P&L for a closed position on a resolved market."""
-    if not market.resolved or not market.outcome:
-        return 0.0
-
-    avg_entry = float(position.avg_entry_price or 0)
-    contracts = float(position.num_contracts or 0)
-
-    if contracts == 0:
-        return 0.0
-
-    # Binary market: payout is $1 per contract if correct, $0 if wrong
-    position_outcome = position.outcome.upper()
-    market_outcome = market.outcome.upper()
-
-    if position_outcome == market_outcome:
-        # Winner: received $1 per contract
-        pnl = (1.0 - avg_entry) * contracts
-    else:
-        # Loser: received $0 per contract
-        pnl = -avg_entry * contracts
-
-    return round(pnl, 2)

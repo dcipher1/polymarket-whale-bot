@@ -46,5 +46,32 @@ async def cache_get(key: str) -> Any | None:
 
 # Event channels
 CHANNEL_NEW_WHALE_TRADE = "whale:new_trade"
-CHANNEL_NEW_SIGNAL = "whale:new_signal"
-CHANNEL_SIGNAL_PROMOTED = "whale:signal_promoted"
+
+# --- Wallet balance helpers ---
+BALANCE_CACHE_KEY = "wallet:usdc_balance"
+BALANCE_CACHE_TTL = 300  # 5 minutes
+
+
+async def update_cached_balance(balance: float) -> None:
+    """Cache the current USDC wallet balance."""
+    from datetime import datetime, timezone
+    await cache_set(BALANCE_CACHE_KEY, {
+        "balance": round(balance, 2),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }, ex=BALANCE_CACHE_TTL)
+
+
+async def get_deployable_capital() -> float:
+    """Get deployable capital: cached wallet balance minus reserve.
+
+    Falls back to starting_capital if cache is empty (e.g. Redis down, first boot).
+    """
+    cached = await cache_get(BALANCE_CACHE_KEY)
+    if cached and "balance" in cached:
+        balance = float(cached["balance"])
+        deployable = balance - settings.wallet_reserve_usdc
+        return max(deployable, 0)
+
+    # Fallback: use static config (legacy behavior)
+    logger.debug("No cached balance — falling back to starting_capital")
+    return settings.starting_capital * settings.max_total_exposure_pct
