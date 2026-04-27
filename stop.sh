@@ -5,6 +5,7 @@ PIDFILE=bot.pid
 if [ ! -f "$PIDFILE" ]; then
     echo "No PID file — trying pkill fallback"
     pkill -f ".venv/bin/python -m src.main" 2>/dev/null
+    tmux kill-session -t whale-bot 2>/dev/null
     sleep 1
     echo "Stopped"
     exit 0
@@ -14,6 +15,8 @@ PID=$(cat "$PIDFILE")
 if ! kill -0 "$PID" 2>/dev/null; then
     echo "Process $PID already dead"
     rm -f "$PIDFILE"
+    pkill -f ".venv/bin/python -m src.main" 2>/dev/null
+    tmux kill-session -t whale-bot 2>/dev/null
     exit 0
 fi
 
@@ -33,6 +36,8 @@ done
 # Force kill
 echo "Force killing..."
 kill -9 "$PID" 2>/dev/null
+pkill -f ".venv/bin/python -m src.main" 2>/dev/null
+tmux kill-session -t whale-bot 2>/dev/null
 sleep 1
 rm -f "$PIDFILE"
 echo "Stopped"

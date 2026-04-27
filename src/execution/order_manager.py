@@ -6,6 +6,20 @@ from src.polymarket.clob_auth import get_auth_client
 
 logger = logging.getLogger(__name__)
 
+MIN_ORDER_PRICE = 0.001
+MAX_ORDER_PRICE = 0.999
+PRICE_TICK = 0.001
+
+
+def quantize_order_price(price: float, side: str) -> float:
+    """Round to CLOB price tick without crossing the caller's limit."""
+    side = side.upper()
+    if side == "BUY":
+        return int(price / PRICE_TICK + 1e-9) * PRICE_TICK
+    if side == "SELL":
+        return (int(price / PRICE_TICK - 1e-9) + 1) * PRICE_TICK
+    return price
+
 
 async def place_order(
     token_id: str,
@@ -30,8 +44,11 @@ async def place_order(
         logger.error("place_order called with empty token_id")
         return None
 
-    if price <= 0 or price >= 1:
-        logger.error("Invalid price %.4f — must be between 0 and 1", price)
+    if price < MIN_ORDER_PRICE or price > MAX_ORDER_PRICE:
+        logger.error(
+            "Invalid price %.6f — must be between %.3f and %.3f",
+            price, MIN_ORDER_PRICE, MAX_ORDER_PRICE,
+        )
         return None
 
     if size <= 0:
@@ -43,12 +60,15 @@ async def place_order(
         logger.error("Invalid side %r — must be BUY or SELL", side)
         return None
 
-    # Round price to the nearest cent (CLOB rejects off-tick prices).
-    # Floor for BUY so we never exceed the requested limit; ceil for SELL symmetrically.
-    if side == "BUY":
-        price = int(price * 100 + 1e-9) / 100
-    else:
-        price = (int(price * 100 - 1e-9) + 1) / 100
+    # Round to CLOB tick. Floor BUY so we never exceed the requested limit;
+    # ceil SELL symmetrically.
+    price = quantize_order_price(price, side)
+    if price < MIN_ORDER_PRICE or price > MAX_ORDER_PRICE:
+        logger.error(
+            "Invalid tick-rounded price %.6f — must be between %.3f and %.3f",
+            price, MIN_ORDER_PRICE, MAX_ORDER_PRICE,
+        )
+        return None
 
     label = tag or token_id[:16]
 

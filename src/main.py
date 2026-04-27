@@ -141,21 +141,28 @@ async def run_bot():
         sys.exit(1)
 
     scheduler = AsyncIOScheduler()
+    interval_job_defaults = {"coalesce": True, "max_instances": 1, "misfire_grace_time": 300}
 
     # Market refresh — lightweight update of tracked markets (on-demand fetch handles new ones)
     from src.indexer.market_ingester import refresh_tracked_markets
-    scheduler.add_job(refresh_tracked_markets, "interval", minutes=settings.market_refresh_interval_minutes, id="market_refresh", coalesce=True, misfire_grace_time=300)
+    scheduler.add_job(
+        refresh_tracked_markets,
+        "interval",
+        minutes=settings.market_refresh_interval_minutes,
+        id="market_refresh",
+        **interval_job_defaults,
+    )
 
     # Resolution tracking — every 15 minutes
     from src.tracking.resolution import check_resolutions, redeem_all_resolved
-    scheduler.add_job(check_resolutions, "interval", minutes=15, id="resolution_check")
+    scheduler.add_job(check_resolutions, "interval", minutes=15, id="resolution_check", **interval_job_defaults)
 
     # Redeem all resolved positions (wins + losses) — every 30 minutes
-    scheduler.add_job(redeem_all_resolved, "interval", minutes=30, id="redemption_sweep")
+    scheduler.add_job(redeem_all_resolved, "interval", minutes=30, id="redemption_sweep", **interval_job_defaults)
 
     # Reconcile DB against Polymarket wallet — every 15 minutes
     from src.execution.reconcile import reconcile_positions as reconcile_job
-    scheduler.add_job(reconcile_job, "interval", minutes=15, id="reconcile")
+    scheduler.add_job(reconcile_job, "interval", minutes=15, id="reconcile", **interval_job_defaults)
 
     # Daily snapshot — once per day at 23:55 UTC
     from src.tracking.snapshots import take_daily_snapshot
@@ -197,6 +204,7 @@ async def run_bot():
             check_geoblock, "interval",
             hours=settings.geoblock_check_interval_hours,
             id="geoblock_recheck",
+            **interval_job_defaults,
         )
 
     scheduler.start()
@@ -260,9 +268,19 @@ async def run_bot():
     except Exception as e:
         logger.error("Position reconciliation failed: %s", e)
 
-    # Start unified sync loop — detects new whale trades + tops up to target in one pass, every 30s.
-    from src.signals.sync_positions import run_sync_loop
-    monitor_task = asyncio.create_task(run_sync_loop(interval_seconds=30))
+    # Start websocket copy path plus a slower polling reconciliation backstop.
+    from src.signals.sync_positions import handle_polynode_wallet_event, run_sync_loop
+    monitor_task = asyncio.create_task(
+        run_sync_loop(interval_seconds=settings.wallet_sync_fallback_interval_seconds)
+    )
+    polynode_task = None
+    if settings.polynode_enabled and settings.polynode_api_key:
+        from src.polymarket.polynode_wallet_ws import PolyNodeWalletStream
+        stream = PolyNodeWalletStream(handle_polynode_wallet_event)
+        polynode_task = asyncio.create_task(stream.run())
+        logger.info("PolyNode wallet websocket started")
+    elif settings.polynode_enabled:
+        logger.warning("PolyNode wallet websocket not started: POLYNODE_API_KEY is not set")
 
     # Start Telegram bot if configured
     telegram_task = None
@@ -279,6 +297,8 @@ async def run_bot():
 
     # Keep-alive: run forever, restart the monitor if it dies
     tasks = {"monitor": monitor_task}
+    if polynode_task is not None:
+        tasks["polynode"] = polynode_task
 
     try:
         while True:
@@ -296,7 +316,13 @@ async def run_bot():
                     logger.warning("Task '%s' exited unexpectedly — restarting in 5s", name)
                 await asyncio.sleep(5)
                 if name == "monitor":
-                    tasks[name] = asyncio.create_task(run_sync_loop(interval_seconds=30))
+                    tasks[name] = asyncio.create_task(
+                        run_sync_loop(interval_seconds=settings.wallet_sync_fallback_interval_seconds)
+                    )
+                elif name == "polynode":
+                    from src.polymarket.polynode_wallet_ws import PolyNodeWalletStream
+                    stream = PolyNodeWalletStream(handle_polynode_wallet_event)
+                    tasks[name] = asyncio.create_task(stream.run())
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Shutting down...")
     finally:

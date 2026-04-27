@@ -226,9 +226,11 @@ async def _check_market_resolution(
         trade.pnl_usdc = Decimal("0")
         trade.exit_price = None
         trade.exit_timestamp = datetime.now(timezone.utc)
-        logger.warning(
-            "Trade %d resolved as UNFILLED (fill_status=%s) — no P&L",
-            trade.id, trade.fill_status,
+    if unfilled_trades:
+        logger.info(
+            "Marked %d non-economic order attempts as UNFILLED for %s",
+            len(unfilled_trades),
+            market.condition_id[:10],
         )
 
     # Attempt to redeem winning on-chain tokens

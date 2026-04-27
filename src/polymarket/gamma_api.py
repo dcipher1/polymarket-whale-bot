@@ -17,6 +17,19 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://gamma-api.polymarket.com"
 API_RESPONSES_DIR = Path("data/api_responses")
 RATE_LIMIT_DELAY = 0.2
+ERROR_LOG_INTERVAL_SECONDS = 300
+_LAST_ERROR_LOG: dict[str, datetime] = {}
+
+
+def _throttled_error(message: str, endpoint: str, exc: Exception) -> None:
+    key = f"{endpoint}:{type(exc).__name__}:{exc}"
+    now = datetime.now(timezone.utc)
+    last = _LAST_ERROR_LOG.get(key)
+    if last is None or (now - last).total_seconds() >= ERROR_LOG_INTERVAL_SECONDS:
+        _LAST_ERROR_LOG[key] = now
+        logger.error(message, endpoint, exc)
+    else:
+        logger.debug(message, endpoint, exc)
 
 
 class GammaToken(BaseModel):
@@ -114,7 +127,7 @@ class GammaAPIClient:
         self, endpoint: str, params: dict[str, Any] | None = None
     ) -> Any:
         session = await self._get_session()
-        url = f"{BASE_URL}/{endpoint}"
+        url = endpoint if endpoint.startswith("http") else f"{BASE_URL}/{endpoint}"
 
         for attempt in range(3):
             try:
@@ -145,7 +158,7 @@ class GammaAPIClient:
                     logger.debug("Market gone (422): %s", endpoint)
                     raise
                 if attempt == 2:
-                    logger.error("Failed to fetch %s after 3 attempts: %s", endpoint, e)
+                    _throttled_error("Failed to fetch %s after 3 attempts: %s", endpoint, e)
                     raise
                 await asyncio.sleep(2 ** attempt)
 
@@ -202,13 +215,22 @@ class GammaAPIClient:
         """Fetch a single market by slug (preferred) or condition_id fallback.
 
         The Gamma path-based endpoint ``/markets/{id}`` expects a numeric ID,
-        NOT a condition_id hex hash, so we always use query-param endpoints.
+        NOT a condition_id hex hash, so Gamma lookups use query-param endpoints.
+        Some Gamma filters are silently ignored, so every response is checked
+        against the requested condition id before it is accepted.
         """
         # Try cache first
         cache_key = f"gamma:market:{condition_id}"
         cached = await cache_get(cache_key)
         if cached:
-            return GammaMarket.model_validate(cached)
+            cached_market = GammaMarket.model_validate(cached)
+            if cached_market.condition_id.lower() == condition_id.lower():
+                return cached_market
+            logger.debug(
+                "Ignoring mismatched cached market for %s: got %s",
+                condition_id[:10],
+                cached_market.condition_id[:10],
+            )
 
         data = None
 
@@ -222,25 +244,81 @@ class GammaAPIClient:
         # Strategy 2: condition_id query param fallback
         if not data or (isinstance(data, list) and not data):
             try:
-                data = await self._request("markets", {"condition_id": condition_id})
+                data = await self._request("markets", {"condition_ids": condition_id})
             except Exception as e:
                 logger.debug("Gamma condition_id lookup failed for %s: %s", condition_id[:10], e)
 
+        market = self._market_from_response(data, condition_id)
+        if market is None:
+            market = await self._get_clob_market(condition_id)
+        if market is None:
+            return None
+
+        await cache_set(cache_key, market.model_dump(by_alias=True), ex=900)  # cache 15 min
+        return market
+
+    def _market_from_response(self, data: Any, condition_id: str) -> GammaMarket | None:
         if not data:
             return None
-
-        if isinstance(data, list) and data:
-            data = data[0]
-        elif isinstance(data, list) and not data:
+        if isinstance(data, dict) and "markets" in data:
+            data = data.get("markets") or []
+        if isinstance(data, list):
+            for item in data:
+                market = GammaMarket.model_validate(item)
+                if market.condition_id.lower() == condition_id.lower():
+                    return market
             return None
-        elif isinstance(data, dict) and "markets" in data:
-            markets = data["markets"]
-            if markets:
-                data = markets[0]
-
         market = GammaMarket.model_validate(data)
-        await cache_set(cache_key, data, ex=900)  # cache 15 min
+        if market.condition_id.lower() != condition_id.lower():
+            logger.debug(
+                "Ignoring mismatched Gamma market for %s: got %s",
+                condition_id[:10],
+                market.condition_id[:10],
+            )
+            return None
         return market
+
+    async def _get_clob_market(self, condition_id: str) -> GammaMarket | None:
+        try:
+            data = await self._request(f"https://clob.polymarket.com/markets/{condition_id}")
+        except Exception as e:
+            logger.debug("CLOB market lookup failed for %s: %s", condition_id[:10], e)
+            return None
+        if not isinstance(data, dict):
+            return None
+        if str(data.get("condition_id") or "").lower() != condition_id.lower():
+            return None
+        token_ids = []
+        outcomes = []
+        for token in data.get("tokens") or []:
+            if not isinstance(token, dict):
+                continue
+            token_id = str(token.get("token_id") or "")
+            if not token_id:
+                continue
+            token_ids.append(token_id)
+            outcomes.append(str(token.get("outcome") or ""))
+
+        payload = {
+            "conditionId": data.get("condition_id") or condition_id,
+            "question": data.get("question") or "",
+            "slug": data.get("market_slug") or data.get("slug") or "",
+            "outcomes": json.dumps(outcomes),
+            "clobTokenIds": json.dumps(token_ids),
+            "endDate": data.get("end_date_iso") or data.get("endDate") or data.get("game_start_time") or "",
+            "active": bool(data.get("active", True)),
+            "closed": bool(data.get("closed", False)),
+            "volume": str(data.get("volume") or data.get("volume_num") or "0"),
+            "liquidityNum": float(data.get("liquidity") or data.get("liquidity_num") or 0),
+            "volume24hr": float(data.get("volume_24hr") or data.get("volume24hr") or 0),
+            "createdAt": data.get("created_at") or data.get("createdAt") or "",
+            "acceptingOrders": bool(data.get("accepting_orders", False)),
+            "description": data.get("description") or "",
+            "gameStartTime": data.get("game_start_time") or "",
+            "events": data.get("events") or [],
+            "tokens": data.get("tokens") or [],
+        }
+        return GammaMarket.model_validate(payload)
 
     async def get_event_tags(self, event_id: str) -> list[str]:
         """Fetch tag labels from an event by numeric ID."""

@@ -168,7 +168,9 @@ class WhaleTrade(Base):
     condition_id: Mapped[str] = mapped_column(
         Text, ForeignKey("markets.condition_id", ondelete="CASCADE"), nullable=False
     )
-    token_id: Mapped[str] = mapped_column(Text, nullable=False)
+    token_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("market_tokens.token_id", ondelete="CASCADE"), nullable=False
+    )
     side: Mapped[str] = mapped_column(Text, nullable=False)
     outcome: Mapped[str] = mapped_column(Text, nullable=False)
     price: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
@@ -188,6 +190,63 @@ class WhaleTrade(Base):
         UniqueConstraint("wallet_address", "tx_hash", "token_id", name="uq_whale_trades_dedup"),
         Index("idx_whale_trades_wallet_time", "wallet_address", timestamp.desc()),
         Index("idx_whale_trades_market", "condition_id", timestamp.desc()),
+    )
+
+
+class WhaleEventBacklog(Base):
+    __tablename__ = "whale_event_backlog"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
+    wallet_address: Mapped[str | None] = mapped_column(Text)
+    condition_id: Mapped[str | None] = mapped_column(Text)
+    token_id: Mapped[str | None] = mapped_column(Text)
+    outcome: Mapped[str | None] = mapped_column(Text)
+    side: Mapped[str | None] = mapped_column(Text)
+    tx_hash: Mapped[str | None] = mapped_column(Text)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    raw_event: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), default=utcnow
+    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    resolved_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("provider", "wallet_address", "tx_hash", "token_id", name="uq_whale_event_backlog_dedup"),
+        Index("idx_whale_event_backlog_open", "created_at", postgresql_where=text("resolved_at IS NULL")),
+        Index("idx_whale_event_backlog_market", "condition_id", "token_id"),
+    )
+
+
+class CopyDecision(Base):
+    __tablename__ = "copy_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    whale_trade_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("whale_trades.id", ondelete="SET NULL")
+    )
+    wallet_address: Mapped[str | None] = mapped_column(Text)
+    condition_id: Mapped[str | None] = mapped_column(Text)
+    outcome: Mapped[str | None] = mapped_column(Text)
+    decision_code: Mapped[str] = mapped_column(Text, nullable=False)
+    decision_reason: Mapped[str | None] = mapped_column(Text)
+    decision_source: Mapped[str] = mapped_column(Text, nullable=False)
+    event_timestamp: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    detected_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    decided_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=utcnow)
+    latency_seconds: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
+    requested_contracts: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    filled_contracts: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    order_ids: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
+    context: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+    __table_args__ = (
+        Index("idx_copy_decisions_whale_trade", "whale_trade_id"),
+        Index("idx_copy_decisions_wallet_time", "wallet_address", decided_at.desc()),
+        Index("idx_copy_decisions_market", "condition_id", "outcome", decided_at.desc()),
+        Index("idx_copy_decisions_source_time", "decision_source", decided_at.desc()),
     )
 
 

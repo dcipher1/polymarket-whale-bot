@@ -45,6 +45,14 @@ class TestMarketClassifier:
         result = classify_market("Will it rain in New York tomorrow?")
         assert result.category == "other"
 
+    def test_daily_high_temperature_is_weather(self):
+        result = classify_market("Will the highest temperature in Madrid be 25°C on April 27?")
+        assert result.category == "weather"
+
+    def test_daily_high_temperature_range_is_weather(self):
+        result = classify_market("Will the highest temperature in Atlanta be between 82-83°F on April 26?")
+        assert result.category == "weather"
+
     def test_excluded_5min_crypto(self):
         result = classify_market("Will BTC go up in the next 5 minutes?")
         assert result.category == "excluded"

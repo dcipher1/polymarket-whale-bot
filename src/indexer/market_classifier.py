@@ -60,6 +60,14 @@ POLYMARKET_CATEGORY_MAP: dict[str, str] = {
 }
 
 CATEGORY_RULES: dict[str, dict] = {
+    "weather": {
+        "tags": ["weather"],
+        "keywords": [
+            "highest temperature",
+            "high temperature",
+            "maximum temperature",
+        ],
+    },
     "macro": {
         "tags": [
             "fed", "fomc", "cpi", "inflation", "unemployment", "gdp", "pce",

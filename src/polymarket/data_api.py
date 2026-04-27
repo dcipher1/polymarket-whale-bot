@@ -19,6 +19,19 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://data-api.polymarket.com"
 API_RESPONSES_DIR = Path("data/api_responses")
 RATE_LIMIT_DELAY = 0.2  # 200ms between calls
+ERROR_LOG_INTERVAL_SECONDS = 300
+_LAST_ERROR_LOG: dict[str, datetime] = {}
+
+
+def _throttled_error(message: str, endpoint: str, exc: Exception) -> None:
+    key = f"{endpoint}:{type(exc).__name__}:{exc}"
+    now = datetime.now(timezone.utc)
+    last = _LAST_ERROR_LOG.get(key)
+    if last is None or (now - last).total_seconds() >= ERROR_LOG_INTERVAL_SECONDS:
+        _LAST_ERROR_LOG[key] = now
+        logger.error(message, endpoint, exc)
+    else:
+        logger.debug(message, endpoint, exc)
 
 
 class _CoerceStr:
@@ -160,7 +173,7 @@ class DataAPIClient:
                     return data
             except aiohttp.ClientError as e:
                 if attempt == 2:
-                    logger.error("Failed to fetch %s after 3 attempts: %s", endpoint, e)
+                    _throttled_error("Failed to fetch %s after 3 attempts: %s", endpoint, e)
                     raise
                 await asyncio.sleep(2 ** attempt)
 

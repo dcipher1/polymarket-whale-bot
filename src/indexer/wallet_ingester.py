@@ -1,7 +1,7 @@
 """Wallet trade and activity ingestion from Data API."""
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 
 from sqlalchemy import select, func
@@ -10,7 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db import async_session
 from src.events import publish, CHANNEL_NEW_WHALE_TRADE
-from src.models import Wallet, WhaleTrade, Market
+from src.indexer.market_ingester import ensure_market
+from src.models import Wallet, WhaleTrade, MarketToken, WhaleEventBacklog
 from src.polymarket.data_api import DataAPIClient, Trade, Activity
 
 logger = logging.getLogger(__name__)
@@ -38,10 +39,12 @@ async def ingest_wallet(
 
             # Get last ingested timestamp for incremental fetch
             since_ts = None
+            previous_last_ts = None
             if not full_backfill:
                 wallet = await session.get(Wallet, address)
                 if wallet and wallet.last_ingested_ts:
-                    since_ts = wallet.last_ingested_ts
+                    previous_last_ts = wallet.last_ingested_ts
+                    since_ts = previous_last_ts - timedelta(minutes=2)
 
             # Fetch trades via activity API (more complete than trades endpoint)
             # In incremental mode, stop paginating once we hit already-seen trades
@@ -70,7 +73,7 @@ async def ingest_wallet(
             trades = [a for a in all_activity if a.type == "TRADE"]
 
             new_count = 0
-            latest_ts = since_ts
+            latest_ts = previous_last_ts
             for trade in trades:
                 inserted = await _upsert_trade(session, address, trade)
                 if inserted:
@@ -81,9 +84,10 @@ async def ingest_wallet(
                 if ts and (latest_ts is None or ts > latest_ts):
                     latest_ts = ts
 
-            # Update wallet stats and last_ingested_ts
-            # Always advance to now so incremental polls don't re-fetch
-            update_ts = datetime.now(timezone.utc) if since_ts else latest_ts
+            # Update wallet stats and last_ingested_ts. Advance only to the
+            # newest observed trade timestamp so late-arriving API rows remain
+            # inside the next incremental window.
+            update_ts = latest_ts
             await _update_wallet_stats(session, address, update_ts)
             await session.commit()
 
@@ -166,6 +170,25 @@ async def _upsert_trade(session: AsyncSession, wallet_address: str, trade: Trade
 
     # Determine condition_id
     condition_id = trade.condition_id or trade.market or ""
+    if not condition_id:
+        return False
+
+    market = await ensure_market(condition_id, session, slug=getattr(trade, "slug", "") or None)
+    if not market:
+        await _backlog_trade(session, wallet_address, trade, condition_id, token_id, outcome, side, "market_hydration_failed")
+        return False
+
+    token = await session.get(MarketToken, token_id)
+    if not token:
+        token_stmt = insert(MarketToken).values(
+            token_id=token_id,
+            condition_id=condition_id,
+            outcome=outcome,
+        ).on_conflict_do_nothing(index_elements=["token_id"])
+        await session.execute(token_stmt)
+    elif token.condition_id != condition_id or token.outcome != outcome:
+        await _backlog_trade(session, wallet_address, trade, condition_id, token_id, outcome, side, "token_mapping_conflict")
+        return False
 
     stmt = insert(WhaleTrade).values(
         wallet_address=wallet_address,
@@ -204,6 +227,57 @@ async def _upsert_trade(session: AsyncSession, wallet_address: str, trade: Trade
         })
 
     return is_new
+
+
+async def _backlog_trade(
+    session: AsyncSession,
+    wallet_address: str,
+    trade: Trade | Activity,
+    condition_id: str,
+    token_id: str,
+    outcome: str,
+    side: str,
+    reason: str,
+) -> None:
+    tx_hash = getattr(trade, "transaction_hash", "") or trade.id
+    raw = {
+        "source": "data_api_wallet_ingester",
+        "wallet_address": wallet_address,
+        "condition_id": condition_id,
+        "token_id": token_id,
+        "outcome": outcome,
+        "side": side,
+        "price": str(getattr(trade, "price", "")),
+        "size": str(getattr(trade, "size", "")),
+        "tx_hash": tx_hash,
+        "timestamp": str(getattr(trade, "timestamp", "")),
+        "title": getattr(trade, "title", ""),
+        "slug": getattr(trade, "slug", ""),
+    }
+    stmt = insert(WhaleEventBacklog).values(
+        provider="data_api",
+        wallet_address=wallet_address,
+        condition_id=condition_id,
+        token_id=token_id,
+        outcome=outcome,
+        side=side,
+        tx_hash=tx_hash or f"data_api:{wallet_address}:{condition_id}:{token_id}:{getattr(trade, 'timestamp', '')}",
+        reason=reason,
+        raw_event=raw,
+        created_at=datetime.now(timezone.utc),
+        last_attempt_at=datetime.now(timezone.utc),
+        attempts=1,
+    ).on_conflict_do_update(
+        constraint="uq_whale_event_backlog_dedup",
+        set_={
+            "reason": reason,
+            "raw_event": raw,
+            "last_attempt_at": datetime.now(timezone.utc),
+            "attempts": WhaleEventBacklog.attempts + 1,
+            "resolved_at": None,
+        },
+    )
+    await session.execute(stmt)
 
 
 async def _update_wallet_stats(

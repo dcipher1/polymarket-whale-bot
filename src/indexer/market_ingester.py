@@ -33,6 +33,14 @@ async def _get_gamma() -> GammaAPIClient:
     return _shared_gamma
 
 
+async def close_shared_gamma() -> None:
+    """Close the shared Gamma client used by market ingestion helpers."""
+    global _shared_gamma
+    if _shared_gamma is not None:
+        await _shared_gamma.close()
+        _shared_gamma = None
+
+
 async def ensure_market(condition_id: str, session: AsyncSession | None = None, slug: str | None = None) -> Market | None:
     """Get a market from DB, or fetch from Gamma API on-demand.
 
@@ -49,9 +57,11 @@ async def ensure_market(condition_id: str, session: AsyncSession | None = None, 
     elif condition_id in _slug_cache:
         slug = _slug_cache[condition_id]
 
-    # Check in-memory cache first (skip cached None — those were from broken lookups)
+    # Check in-memory cache first (skip cached None — those were from broken lookups).
+    # When a slug is supplied, prefer a DB/Gamma refresh so websocket placeholder
+    # rows can be upgraded to full metadata.
     cached = _market_cache.get(condition_id)
-    if cached is not None:
+    if cached is not None and not slug:
         return cached
 
     owns_session = session is None
@@ -60,9 +70,10 @@ async def ensure_market(condition_id: str, session: AsyncSession | None = None, 
         await session.__aenter__()
 
     try:
-        # Check DB
+        # Check DB. Existing rows created from websocket events may be only
+        # placeholders; refresh those rather than treating them as authoritative.
         market = await session.get(Market, condition_id)
-        if market:
+        if market and not await _market_needs_hydration(session, market):
             _market_cache[condition_id] = market
             return market
 
@@ -89,7 +100,10 @@ async def ensure_market(condition_id: str, session: AsyncSession | None = None, 
                 break
 
         await _upsert_market(session, gm, event_tags=event_tags)
-        await session.commit()
+        if owns_session:
+            await session.commit()
+        else:
+            await session.flush()
 
         market = await session.get(Market, condition_id)
         _market_cache[condition_id] = market
@@ -98,6 +112,20 @@ async def ensure_market(condition_id: str, session: AsyncSession | None = None, 
     finally:
         if owns_session:
             await session.__aexit__(None, None, None)
+
+
+async def _market_needs_hydration(session: AsyncSession, market: Market) -> bool:
+    """Return True for placeholder/incomplete rows that need Gamma metadata."""
+    if not market.question or market.question == market.condition_id:
+        return True
+    if not market.slug or not market.resolution_time:
+        return True
+    result = await session.execute(
+        select(func.count(MarketToken.token_id)).where(
+            MarketToken.condition_id == market.condition_id
+        )
+    )
+    return int(result.scalar() or 0) == 0
 
 
 _refresh_sem = asyncio.Semaphore(5)
@@ -262,10 +290,16 @@ async def _upsert_market(session: AsyncSession, gm: GammaMarket, event_tags: lis
         set_={
             "question": gm.question,
             "slug": gm.slug,
+            "category": result.category,
+            "category_matched_keywords": result.matched_keywords or None,
+            "category_matched_tags": result.matched_tags or None,
+            "classification_source": result.source,
+            "resolution_time": resolution_time,
             "resolved": gm.closed,
             "volume_usdc": volume,
             "liquidity_usdc": liquidity,
             "volume_24hr_usdc": volume_24hr,
+            "created_at": created_at,
             "last_updated": datetime.now(timezone.utc),
             "tags": tag_labels or None,
         },

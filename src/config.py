@@ -12,6 +12,14 @@ class Settings(BaseSettings):
     polymarket_api_secret: str = ""
     polymarket_api_passphrase: str = ""
 
+    # PolyNode wallet websocket
+    polynode_api_key: str = ""
+    polynode_ws_url: str = "wss://ws.polynode.dev/ws"
+    polynode_enabled: bool = True
+    polynode_snapshot_count: int = 50
+    polynode_subscription_type: str = "dome"
+    wallet_sync_fallback_interval_seconds: float = 300
+
     # Infrastructure
     database_url: str = "postgresql+asyncpg://whale:whale@localhost:5432/whale_bot"
     redis_url: str = "redis://localhost:6379/0"
@@ -173,7 +181,7 @@ class Settings(BaseSettings):
 
     _SENSITIVE_FIELDS = {
         "polymarket_private_key", "polymarket_api_key", "polymarket_api_secret",
-        "polymarket_api_passphrase", "telegram_bot_token",
+        "polymarket_api_passphrase", "polynode_api_key", "telegram_bot_token",
     }
 
     def __repr__(self) -> str:
