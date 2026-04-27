@@ -1,6 +1,7 @@
 """Thin wrapper around py-clob-client for CLOB API interactions."""
 
 import logging
+import math
 from typing import Any
 
 import aiohttp
@@ -11,6 +12,36 @@ from src.events import cache_get, cache_set
 logger = logging.getLogger(__name__)
 
 CLOB_BASE_URL = "https://clob.polymarket.com"
+
+
+def _coerce_midpoint(value: Any) -> float | None:
+    try:
+        mid = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(mid) or math.isinf(mid) or mid < 0 or mid > 1:
+        return None
+    return mid
+
+
+def _parse_midpoints_response(data: Any) -> dict[str, float | None]:
+    """Normalize CLOB /midpoints response shapes into token_id -> midpoint."""
+    parsed: dict[str, float | None] = {}
+    if isinstance(data, dict):
+        for token_id, value in data.items():
+            if isinstance(value, dict):
+                value = value.get("mid") or value.get("price")
+            parsed[str(token_id)] = _coerce_midpoint(value)
+        return parsed
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            token_id = item.get("token_id") or item.get("asset_id") or item.get("asset")
+            if not token_id:
+                continue
+            parsed[str(token_id)] = _coerce_midpoint(item.get("mid") or item.get("price"))
+    return parsed
 
 
 class CLOBClient:
@@ -66,6 +97,25 @@ class CLOBClient:
         except Exception as e:
             logger.warning("Midpoint fetch failed for %s: %s", token_id, e)
         return None
+
+    async def get_midpoints(self, token_ids: list[str]) -> dict[str, float | None]:
+        """Get fresh midpoint prices for a batch of token IDs."""
+        unique_ids = sorted({str(token_id) for token_id in token_ids if token_id})
+        if not unique_ids:
+            return {}
+        try:
+            session = await self._get_session()
+            body = [{"token_id": token_id} for token_id in unique_ids]
+            async with session.post(f"{CLOB_BASE_URL}/midpoints", json=body) as resp:
+                if resp.status != 200:
+                    logger.warning("Batch midpoint fetch failed with status %s", resp.status)
+                    return {token_id: None for token_id in unique_ids}
+                data = await resp.json()
+                parsed = _parse_midpoints_response(data)
+                return {token_id: parsed.get(token_id) for token_id in unique_ids}
+        except Exception as e:
+            logger.warning("Batch midpoint fetch failed for %d tokens: %s", len(unique_ids), e)
+            return {token_id: None for token_id in unique_ids}
 
     async def get_orderbook(self, token_id: str) -> dict | None:
         """Get full orderbook for a token."""

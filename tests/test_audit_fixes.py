@@ -287,6 +287,27 @@ def test_candidate_resolution_gate_allows_nyc_same_local_evening():
     assert resolution_time == datetime(2026, 4, 26, 4, 0, tzinfo=timezone.utc)
 
 
+def test_candidate_resolution_gate_allows_sao_paulo_same_local_day_with_generic_midnight():
+    now = datetime(2026, 4, 26, 16, 58, tzinfo=timezone.utc)
+    market = type(
+        "MarketStub",
+        (),
+        {
+            "category": "weather",
+            "category_override": None,
+            "question": "Will the highest temperature in Sao Paulo be 31°C on April 26?",
+            "resolution_time": datetime(2026, 4, 26, 0, 0, tzinfo=timezone.utc),
+        },
+    )()
+    pos = type("PositionStub", (), {"end_date": "2026-04-26", "title": ""})()
+
+    allowed, code, resolution_time = sync_positions._candidate_resolution_gate(market, pos, now)
+
+    assert allowed is True
+    assert code == "weather_local_date_active"
+    assert resolution_time == datetime(2026, 4, 27, 3, 0, tzinfo=timezone.utc)
+
+
 def test_candidate_resolution_gate_quiets_weather_after_city_local_day():
     now = datetime(2026, 4, 25, 16, 1, tzinfo=timezone.utc)
     market = type(

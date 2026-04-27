@@ -6,8 +6,11 @@ import argparse
 import asyncio
 import io
 import math
+import re
+import sys
 from datetime import datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from rich import box
@@ -18,6 +21,15 @@ from sqlalchemy import text
 from src.config import settings
 from src.db import async_session
 from src.polymarket.clob_client import CLOBClient
+from src.signals.weather_resolution import parse_dt, weather_local_resolution_cutoff
+
+
+class FreshPriceError(RuntimeError):
+    """Raised when the MTM report cannot get required fresh live prices."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(f"{code}: {message}")
+        self.code = code
 
 
 def _money(value) -> str:
@@ -49,6 +61,25 @@ def _short_market(question: str, condition_id: str) -> str:
     for old, new in replacements:
         text_value = text_value.replace(old, new)
     return text_value[:64]
+
+
+_WEATHER_QUESTION_RE = re.compile(
+    r"^Will the highest temperature in (?P<city>.+?) be "
+    r"(?:(?:between )?(?P<temp>.+?)) on (?P<month>[A-Za-z]+) (?P<day>\d{1,2})\??$"
+)
+
+
+def _position_parts(question: str, condition_id: str) -> tuple[str, str, str]:
+    """Return display columns (city, temp, date) for a weather market title."""
+    clean = (question or "").replace("|", "/").replace("\n", " ").strip()
+    clean = re.sub(r"\s+", " ", clean)
+    match = _WEATHER_QUESTION_RE.match(clean)
+    if not match:
+        return _short_market(question, condition_id), "", ""
+    city = match.group("city").strip()
+    temp = match.group("temp").strip()
+    date = f"{match.group('month')[:3]}{int(match.group('day'))}"
+    return city, temp, date
 
 
 def _copy_state(row) -> str:
@@ -94,16 +125,28 @@ def _fallback_reason(row) -> str:
     if row.latest_decision_code and row.latest_decision_code != "SELL_IGNORED":
         return row.latest_decision_code
     if int(row.order_attempts or 0) > 0 and float(row.filled_contracts or 0) <= 0:
-        return "orders cancelled/no fill"
+        return "orders_cancelled/no_fill"
     if int(row.order_attempts or 0) > 0:
         return "filled/part-filled"
     if not row.question:
-        return "missing market"
+        return "missing_market"
     if row.category != "weather":
         return f"non-weather:{row.category or 'unknown'}"
-    if row.resolution_time and row.resolution_time < datetime.now(row.resolution_time.tzinfo):
-        return "past resolution/stale"
-    return "no order logged"
+
+    first_whale_ts = parse_dt(getattr(row, "first_whale_ts", None))
+    last_whale_ts = parse_dt(getattr(row, "last_whale_ts", None)) or first_whale_ts
+    cutoff = weather_local_resolution_cutoff(
+        title=row.question,
+        category=row.category,
+        resolution_time=getattr(row, "resolution_time", None),
+        now_utc=first_whale_ts,
+    )
+    if cutoff is not None and first_whale_ts is not None:
+        if first_whale_ts >= cutoff:
+            return "PAST_CITY_CUTOFF"
+        if last_whale_ts is not None and last_whale_ts >= cutoff:
+            return "MIXED_CITY_CUTOFF"
+    return "NO_DECISION_LOGGED"
 
 
 async def _fetch_position_breakdown_rows(start_utc: datetime, end_utc: datetime, tz_name: str):
@@ -146,7 +189,32 @@ async def _fetch_position_breakdown_rows(start_utc: datetime, end_utc: datetime,
               AND t.source_wallets IS NOT NULL
             GROUP BY 1, 2, 3, 4
         ),
-        latest_decision AS (
+        latest_trade_decision AS (
+            SELECT DISTINCT ON (
+                       wt.wallet_address,
+                       wt.condition_id,
+                       wt.outcome,
+                       (wt.timestamp AT TIME ZONE :tz)::date
+                   )
+                   wt.wallet_address,
+                   wt.condition_id,
+                   wt.outcome,
+                   (wt.timestamp AT TIME ZONE :tz)::date AS local_day,
+                   cd.decision_code,
+                   cd.decision_reason,
+                   cd.decision_source,
+                   cd.latency_seconds,
+                   cd.decided_at
+            FROM whale_trades wt
+            JOIN copy_decisions cd ON cd.whale_trade_id = wt.id
+            WHERE wt.side = 'BUY'
+              AND wt.timestamp >= :start_utc
+              AND wt.timestamp < :end_utc
+              AND wt.wallet_address = ANY(:wallets)
+              AND cd.decision_code <> 'SELL_IGNORED'
+            ORDER BY wt.wallet_address, wt.condition_id, wt.outcome, (wt.timestamp AT TIME ZONE :tz)::date, cd.decided_at DESC
+        ),
+        latest_day_decision AS (
             SELECT DISTINCT ON (
                        wallet_address,
                        condition_id,
@@ -165,6 +233,7 @@ async def _fetch_position_breakdown_rows(start_utc: datetime, end_utc: datetime,
             FROM copy_decisions
             WHERE decided_at >= :start_utc
               AND decided_at < :end_utc
+              AND whale_trade_id IS NULL
               AND decision_code <> 'SELL_IGNORED'
             ORDER BY wallet_address, condition_id, outcome, (decided_at AT TIME ZONE :tz)::date, decided_at DESC
         )
@@ -179,11 +248,11 @@ async def _fetch_position_breakdown_rows(start_utc: datetime, end_utc: datetime,
                coalesce(ot.statuses, '') AS statuses,
                ot.first_order_ts,
                ot.last_order_ts,
-               ld.decision_code AS latest_decision_code,
-               ld.decision_reason AS latest_decision_reason,
-               ld.decision_source AS latest_decision_source,
-               ld.latency_seconds AS latest_latency_seconds,
-               ld.decided_at AS latest_decided_at
+               coalesce(ltd.decision_code, ldd.decision_code) AS latest_decision_code,
+               coalesce(ltd.decision_reason, ldd.decision_reason) AS latest_decision_reason,
+               coalesce(ltd.decision_source, ldd.decision_source) AS latest_decision_source,
+               coalesce(ltd.latency_seconds, ldd.latency_seconds) AS latest_latency_seconds,
+               coalesce(ltd.decided_at, ldd.decided_at) AS latest_decided_at
         FROM wb
         LEFT JOIN ot
           ON ot.wallet_address = wb.wallet_address
@@ -191,11 +260,16 @@ async def _fetch_position_breakdown_rows(start_utc: datetime, end_utc: datetime,
          AND ot.outcome = wb.outcome
          AND ot.local_day = wb.local_day
         LEFT JOIN markets m ON m.condition_id = wb.condition_id
-        LEFT JOIN latest_decision ld
-          ON ld.wallet_address = wb.wallet_address
-         AND ld.condition_id = wb.condition_id
-         AND ld.outcome = wb.outcome
-         AND ld.local_day = wb.local_day
+        LEFT JOIN latest_trade_decision ltd
+          ON ltd.wallet_address = wb.wallet_address
+         AND ltd.condition_id = wb.condition_id
+         AND ltd.outcome = wb.outcome
+         AND ltd.local_day = wb.local_day
+        LEFT JOIN latest_day_decision ldd
+          ON ldd.wallet_address = wb.wallet_address
+         AND ldd.condition_id = wb.condition_id
+         AND ldd.outcome = wb.outcome
+         AND ldd.local_day = wb.local_day
         ORDER BY wb.local_day, array_position(:wallets, wb.wallet_address), wb.whale_cost DESC
         """
     )
@@ -225,6 +299,7 @@ async def _fetch_rows(start_utc: datetime, end_utc: datetime, tz_name: str):
                    sum(wt.size_usdc)::float AS whale_cost,
                    count(*) AS whale_events,
                    min(wt.timestamp) AS first_whale_ts,
+                   max(wt.timestamp) AS last_whale_ts,
                    min(wt.detected_at) AS first_detected_at,
                    min(wt.id) AS first_whale_trade_id
             FROM whale_trades wt
@@ -250,11 +325,42 @@ async def _fetch_rows(start_utc: datetime, end_utc: datetime, tz_name: str):
               AND source_wallets IS NOT NULL
             GROUP BY 1, 2, 3
         ),
-        latest_decision AS (
-            SELECT DISTINCT ON (wallet_address, condition_id, outcome)
+        latest_trade_decision AS (
+            SELECT DISTINCT ON (
+                       wt.wallet_address,
+                       wt.condition_id,
+                       wt.outcome,
+                       (wt.timestamp AT TIME ZONE :tz)::date
+                   )
+                   wt.wallet_address,
+                   wt.condition_id,
+                   wt.outcome,
+                   (wt.timestamp AT TIME ZONE :tz)::date AS local_day,
+                   cd.decision_code,
+                   cd.decision_reason,
+                   cd.decision_source,
+                   cd.latency_seconds,
+                   cd.decided_at
+            FROM whale_trades wt
+            JOIN copy_decisions cd ON cd.whale_trade_id = wt.id
+            WHERE wt.side = 'BUY'
+              AND wt.timestamp >= :start_utc
+              AND wt.timestamp < :end_utc
+              AND wt.wallet_address = ANY(:wallets)
+              AND cd.decision_code <> 'SELL_IGNORED'
+            ORDER BY wt.wallet_address, wt.condition_id, wt.outcome, (wt.timestamp AT TIME ZONE :tz)::date, cd.decided_at DESC
+        ),
+        latest_day_decision AS (
+            SELECT DISTINCT ON (
+                       wallet_address,
+                       condition_id,
+                       outcome,
+                       (decided_at AT TIME ZONE :tz)::date
+                   )
                    wallet_address,
                    condition_id,
                    outcome,
+                   (decided_at AT TIME ZONE :tz)::date AS local_day,
                    decision_code,
                    decision_reason,
                    decision_source,
@@ -263,8 +369,9 @@ async def _fetch_rows(start_utc: datetime, end_utc: datetime, tz_name: str):
             FROM copy_decisions
             WHERE decided_at >= :start_utc
               AND decided_at < :end_utc
+              AND whale_trade_id IS NULL
               AND decision_code <> 'SELL_IGNORED'
-            ORDER BY wallet_address, condition_id, outcome, decided_at DESC
+            ORDER BY wallet_address, condition_id, outcome, (decided_at AT TIME ZONE :tz)::date, decided_at DESC
         )
         SELECT wb.*,
                coalesce(m.question, '') AS question,
@@ -278,20 +385,26 @@ async def _fetch_rows(start_utc: datetime, end_utc: datetime, tz_name: str):
                coalesce(ot.filled_cost, 0)::float AS filled_cost,
                coalesce(ot.statuses, '') AS statuses,
                ot.first_order_ts,
-               ld.decision_code AS latest_decision_code,
-               ld.decision_reason AS latest_decision_reason,
-               ld.decision_source AS latest_decision_source,
-               ld.latency_seconds AS latest_latency_seconds
+               coalesce(ltd.decision_code, ldd.decision_code) AS latest_decision_code,
+               coalesce(ltd.decision_reason, ldd.decision_reason) AS latest_decision_reason,
+               coalesce(ltd.decision_source, ldd.decision_source) AS latest_decision_source,
+               coalesce(ltd.latency_seconds, ldd.latency_seconds) AS latest_latency_seconds
         FROM wb
         LEFT JOIN ot
           ON ot.wallet_address = wb.wallet_address
          AND ot.condition_id = wb.condition_id
          AND ot.outcome = wb.outcome
         LEFT JOIN markets m ON m.condition_id = wb.condition_id
-        LEFT JOIN latest_decision ld
-          ON ld.wallet_address = wb.wallet_address
-         AND ld.condition_id = wb.condition_id
-         AND ld.outcome = wb.outcome
+        LEFT JOIN latest_trade_decision ltd
+          ON ltd.wallet_address = wb.wallet_address
+         AND ltd.condition_id = wb.condition_id
+         AND ltd.outcome = wb.outcome
+         AND ltd.local_day = wb.local_day
+        LEFT JOIN latest_day_decision ldd
+          ON ldd.wallet_address = wb.wallet_address
+         AND ldd.condition_id = wb.condition_id
+         AND ldd.outcome = wb.outcome
+         AND ldd.local_day = wb.local_day
         ORDER BY wb.local_day, wb.wallet_address, wb.whale_cost DESC
         """
     )
@@ -308,25 +421,53 @@ async def _fetch_rows(start_utc: datetime, end_utc: datetime, tz_name: str):
         return result.fetchall()
 
 
-async def _midpoints(rows, timeout_seconds: float) -> dict[str, float | None]:
+def _needs_live_price(row) -> bool:
+    return bool(row.token_id) and not (getattr(row, "resolved", False) and getattr(row, "resolved_outcome", None))
+
+
+def _missing_price_message(rows, missing_tokens: set[str]) -> str:
+    labels = []
+    seen = set()
+    for row in rows:
+        if row.token_id not in missing_tokens or row.token_id in seen:
+            continue
+        seen.add(row.token_id)
+        labels.append(f"{_short_market(row.question, row.condition_id)} {row.outcome} ({row.token_id[:16]})")
+        if len(labels) >= 10:
+            break
+    more = max(len(missing_tokens) - len(labels), 0)
+    suffix = f"; +{more} more" if more else ""
+    return f"missing fresh CLOB midpoints for {len(missing_tokens)} token(s): " + "; ".join(labels) + suffix
+
+
+async def _midpoints(
+    rows,
+    timeout_seconds: float,
+    *,
+    allow_missing: bool = False,
+) -> tuple[dict[str, float | None], datetime | None]:
     clob = CLOBClient()
     try:
-        tokens = sorted({row.token_id for row in rows if row.token_id})
-        sem = asyncio.Semaphore(24)
-        mids: dict[str, float | None] = {}
-
-        async def one(token_id: str):
-            async with sem:
-                try:
-                    mids[token_id] = await asyncio.wait_for(
-                        clob.get_midpoint(token_id),
-                        timeout=timeout_seconds,
-                    )
-                except asyncio.TimeoutError:
-                    mids[token_id] = None
-
-        await asyncio.gather(*(one(token) for token in tokens))
-        return mids
+        tokens = sorted({row.token_id for row in rows if _needs_live_price(row)})
+        if not tokens:
+            return {}, None
+        fetched_at = datetime.now(ZoneInfo("UTC"))
+        try:
+            mids = await asyncio.wait_for(clob.get_midpoints(tokens), timeout=timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            raise FreshPriceError(
+                "clob_timeout",
+                f"timed out after {timeout_seconds:.1f}s fetching {len(tokens)} live midpoint(s)",
+            ) from exc
+        except Exception as exc:
+            raise FreshPriceError(
+                "network_unavailable",
+                f"could not fetch {len(tokens)} live midpoint(s): {exc}",
+            ) from exc
+        missing = {token for token in tokens if mids.get(token) is None}
+        if missing and not allow_missing:
+            raise FreshPriceError("missing_midpoints", _missing_price_message(rows, missing))
+        return mids, fetched_at
     finally:
         await clob.close()
 
@@ -339,13 +480,24 @@ def _local_window(days: int, tz_name: str) -> tuple[datetime, datetime]:
     return start_local.astimezone(ZoneInfo("UTC")), end_local.astimezone(ZoneInfo("UTC"))
 
 
-def _render_markdown(rows, mids, tz_name: str) -> str:
+def _render_markdown(
+    rows,
+    mids,
+    tz_name: str,
+    *,
+    price_fetched_at: datetime | None = None,
+    price_source: str = "clob_midpoints",
+) -> str:
     names = {wallet.lower(): wallet[:10] for wallet in settings.watch_whales}
     lines = [
         "# Whale Copy Report",
         f"Timezone: {tz_name}",
-        "MTM uses current CLOB midpoint when available; resolved markets use 1/0.",
+        "MTM uses fresh CLOB batch midpoints for unresolved markets; resolved markets use 1/0.",
+        f"price_source={price_source}",
     ]
+    if price_fetched_at is not None:
+        lines.append(f"price_fetched_at={price_fetched_at.isoformat()}")
+        lines.append("price_age_seconds=0")
     summary = {}
     for row in rows:
         key = str(row.local_day)
@@ -357,7 +509,7 @@ def _render_markdown(rows, mids, tz_name: str) -> str:
     enriched = []
     for row in rows:
         mid = mids.get(row.token_id)
-        if row.resolved and row.resolved_outcome:
+        if getattr(row, "resolved", False) and getattr(row, "resolved_outcome", None):
             mid = 1.0 if row.resolved_outcome == row.outcome else 0.0
         whale_contracts = float(row.whale_contracts or 0)
         whale_cost = float(row.whale_cost or 0)
@@ -390,7 +542,7 @@ def _render_markdown(rows, mids, tz_name: str) -> str:
             lines.append("| Market | Side | Whale shares/cost | Mid | Whale MTM | Our status | Our fill/cost | Our MTM | Decision | Source/latency |")
             lines.append("|---|---:|---:|---:|---:|---|---:|---:|---|---|")
             for row, mid, whale_mtm, our_mtm in wallet_rows:
-                source = row.latest_decision_source or "inferred"
+                source = row.latest_decision_source or "no_decision"
                 if row.latest_latency_seconds is not None:
                     source = f"{source}/{float(row.latest_latency_seconds):.1f}s"
                 lines.append(
@@ -474,57 +626,47 @@ def _render_position_breakdown_markdown(rows, tz_name: str) -> str:
             + " |"
         )
 
-    for day in sorted({str(row.local_day) for row in rows}):
-        lines.append(f"\n## {day}")
-        for wallet in sorted(
-            {row.wallet_address for row in rows if str(row.local_day) == day},
-            key=lambda value: wallet_order.get(value, 999),
-        ):
-            wallet_rows = [
-                row for row in rows
-                if str(row.local_day) == day and row.wallet_address == wallet
-            ]
-            if not wallet_rows:
-                continue
-            lines.append(f"\n### Whale {names.get(wallet, wallet[:10])}")
-            lines.append(
-                "| Market | Side | Whale buy fills | Whale contracts | Whale cost | Bot attempts | "
-                "Bot filled | Unfilled gap | Copy % | Status | Reason | Source |"
+    lines.append("\n## Positions")
+    lines.append(
+        "| Day | Whale | City | Temp | Date | Side | Whale fills | Whale contracts | Whale cost | "
+        "Bot attempts | Bot filled | Gap | Copy % | Status | Reason | Source |"
+    )
+    lines.append("|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|")
+    for row in sorted(rows, key=lambda r: (str(r.local_day), wallet_order.get(r.wallet_address, 999), r.question, r.outcome)):
+        whale_contracts = float(row.whale_contracts or 0)
+        filled_contracts = float(row.filled_contracts or 0)
+        unfilled_gap = max(whale_contracts - filled_contracts, 0.0)
+        status = _position_copy_status(whale_contracts, filled_contracts, row.order_attempts)
+        city, temp, market_date = _position_parts(row.question, row.condition_id)
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(row.local_day),
+                    names.get(row.wallet_address, row.wallet_address[:10]),
+                    city,
+                    temp,
+                    market_date,
+                    row.outcome,
+                    _num(row.whale_buy_fills),
+                    _num(whale_contracts),
+                    _money(row.whale_cost),
+                    _num(row.order_attempts),
+                    _num(filled_contracts),
+                    _num(unfilled_gap),
+                    _copy_pct(whale_contracts, filled_contracts),
+                    status,
+                    _fallback_reason(row),
+                    _source_label(row),
+                ]
             )
-            lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|")
-            for row in wallet_rows:
-                whale_contracts = float(row.whale_contracts or 0)
-                filled_contracts = float(row.filled_contracts or 0)
-                unfilled_gap = max(whale_contracts - filled_contracts, 0.0)
-                status = _position_copy_status(whale_contracts, filled_contracts, row.order_attempts)
-                source = row.latest_decision_source or "inferred"
-                if row.latest_latency_seconds is not None:
-                    source = f"{source}/{float(row.latest_latency_seconds):.1f}s"
-                lines.append(
-                    "| "
-                    + " | ".join(
-                        [
-                            _short_market(row.question, row.condition_id),
-                            row.outcome,
-                            _num(row.whale_buy_fills),
-                            _num(whale_contracts),
-                            _money(row.whale_cost),
-                            _num(row.order_attempts),
-                            _num(filled_contracts),
-                            _num(unfilled_gap),
-                            _copy_pct(whale_contracts, filled_contracts),
-                            status,
-                            _fallback_reason(row),
-                            source,
-                        ]
-                    )
-                    + " |"
-                )
+            + " |"
+        )
     return "\n".join(lines)
 
 
 def _source_label(row) -> str:
-    source = row.latest_decision_source or "inferred"
+    source = row.latest_decision_source or "no_decision"
     if row.latest_latency_seconds is not None:
         source = f"{source}/{float(row.latest_latency_seconds):.1f}s"
     return source
@@ -576,7 +718,7 @@ def _render_position_breakdown_text(rows, tz_name: str, width: int = 220) -> str
     console.print("One row = aggregate whale BUY position by wallet + market + side + local day.")
     console.print()
 
-    summary_table = Table(title="Summary", box=box.SIMPLE, show_edge=True)
+    summary_table = Table(title="Summary", box=box.ROUNDED, show_edge=True)
     for column, justify in (
         ("Day", "left"),
         ("Whale", "left"),
@@ -611,81 +753,115 @@ def _render_position_breakdown_text(rows, tz_name: str, width: int = 220) -> str
         )
     console.print(summary_table)
 
-    for day in sorted({str(row.local_day) for row in rows}):
-        console.print()
-        console.print(f"{day}")
-        for wallet in sorted(
-            {row.wallet_address for row in rows if str(row.local_day) == day},
-            key=lambda value: wallet_order.get(value, 999),
-        ):
-            wallet_rows = [
-                row for row in rows
-                if str(row.local_day) == day and row.wallet_address == wallet
-            ]
-            if not wallet_rows:
-                continue
-            detail = Table(title=f"Whale {names.get(wallet, wallet[:10])}", box=box.SIMPLE, show_edge=True)
-            for column, justify in (
-                ("Market", "left"),
-                ("Side", "center"),
-                ("W fills", "right"),
-                ("W ct", "right"),
-                ("W cost", "right"),
-                ("Attempts", "right"),
-                ("Bot ct", "right"),
-                ("Gap", "right"),
-                ("Copy", "right"),
-                ("Status", "left"),
-                ("Reason", "left"),
-                ("Source", "left"),
-            ):
-                detail.add_column(column, justify=justify, no_wrap=(column != "Market"))
+    detail = Table(title="Positions", box=box.ROUNDED, show_edge=True, show_lines=True)
+    for column, justify, nowrap in (
+        ("Day", "left", True),
+        ("Whale", "left", True),
+        ("City", "left", False),
+        ("Temp", "right", True),
+        ("Date", "left", True),
+        ("Side", "center", True),
+        ("W fills", "right", True),
+        ("W ct", "right", True),
+        ("W cost", "right", True),
+        ("Attempts", "right", True),
+        ("Bot ct", "right", True),
+        ("Gap", "right", True),
+        ("Copy", "right", True),
+        ("Status", "left", True),
+        ("Reason", "left", True),
+        ("Source", "left", True),
+    ):
+        detail.add_column(column, justify=justify, no_wrap=nowrap)
 
-            for row in wallet_rows:
-                whale_contracts = float(row.whale_contracts or 0)
-                filled_contracts = float(row.filled_contracts or 0)
-                unfilled_gap = max(whale_contracts - filled_contracts, 0.0)
-                detail.add_row(
-                    _short_market(row.question, row.condition_id),
-                    row.outcome,
-                    _num(row.whale_buy_fills),
-                    _num(whale_contracts),
-                    _money(row.whale_cost),
-                    _num(row.order_attempts),
-                    _num(filled_contracts),
-                    _num(unfilled_gap),
-                    _copy_pct(whale_contracts, filled_contracts),
-                    _position_copy_status(whale_contracts, filled_contracts, row.order_attempts),
-                    _fallback_reason(row),
-                    _source_label(row),
-                )
-            console.print(detail)
+    for row in sorted(rows, key=lambda r: (str(r.local_day), wallet_order.get(r.wallet_address, 999), r.question, r.outcome)):
+        whale_contracts = float(row.whale_contracts or 0)
+        filled_contracts = float(row.filled_contracts or 0)
+        unfilled_gap = max(whale_contracts - filled_contracts, 0.0)
+        city, temp, market_date = _position_parts(row.question, row.condition_id)
+        detail.add_row(
+            str(row.local_day),
+            names.get(row.wallet_address, row.wallet_address[:10]),
+            city,
+            temp,
+            market_date,
+            row.outcome,
+            _num(row.whale_buy_fills),
+            _num(whale_contracts),
+            _money(row.whale_cost),
+            _num(row.order_attempts),
+            _num(filled_contracts),
+            _num(unfilled_gap),
+            _copy_pct(whale_contracts, filled_contracts),
+            _position_copy_status(whale_contracts, filled_contracts, row.order_attempts),
+            _fallback_reason(row),
+            _source_label(row),
+        )
+    console.print()
+    console.print(detail)
     return console.export_text(styles=False).rstrip()
+
+
+def _emit_report(rendered: str, output_file: str | None) -> None:
+    if not output_file:
+        print(rendered)
+        return
+
+    path = Path(output_file).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{rendered}\n", encoding="utf-8")
+    print(f"Wrote report to {path}")
 
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=2)
     parser.add_argument("--timezone", default="America/Montreal")
-    parser.add_argument("--midpoint-timeout", type=float, default=2.5)
+    parser.add_argument("--midpoint-timeout", type=float, default=5.0)
+    parser.add_argument("--price-timeout-seconds", type=float, default=None)
     parser.add_argument("--no-live-midpoints", action="store_true")
+    parser.add_argument("--allow-missing-live-prices", action="store_true")
     parser.add_argument("--position-breakdown", action="store_true")
     parser.add_argument("--format", choices=("markdown", "text"), default="text")
+    parser.add_argument("--output-file")
     args = parser.parse_args()
+    price_timeout = args.price_timeout_seconds if args.price_timeout_seconds is not None else args.midpoint_timeout
 
     start_utc, end_utc = _local_window(args.days, args.timezone)
     if args.position_breakdown:
         rows = await _fetch_position_breakdown_rows(start_utc, end_utc, args.timezone)
         if args.format == "markdown":
-            print(_render_position_breakdown_markdown(rows, args.timezone))
+            rendered = _render_position_breakdown_markdown(rows, args.timezone)
         else:
-            print(_render_position_breakdown_text(rows, args.timezone))
+            rendered = _render_position_breakdown_text(rows, args.timezone)
+        _emit_report(rendered, args.output_file)
         return
 
     rows = await _fetch_rows(start_utc, end_utc, args.timezone)
-    mids = {} if args.no_live_midpoints else await _midpoints(rows, args.midpoint_timeout)
-    print(_render_markdown(rows, mids, args.timezone))
+    if args.no_live_midpoints:
+        mids = {}
+        price_fetched_at = None
+        price_source = "disabled"
+    else:
+        mids, price_fetched_at = await _midpoints(
+            rows,
+            price_timeout,
+            allow_missing=args.allow_missing_live_prices,
+        )
+        price_source = "clob_midpoints"
+    rendered = _render_markdown(
+            rows,
+            mids,
+            args.timezone,
+            price_fetched_at=price_fetched_at,
+            price_source=price_source,
+        )
+    _emit_report(rendered, args.output_file)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except FreshPriceError as exc:
+        print(f"ERROR fresh_price_required: {exc}", file=sys.stderr)
+        raise SystemExit(2)

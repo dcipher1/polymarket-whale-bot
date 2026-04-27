@@ -13,6 +13,7 @@ from py_clob_client.clob_types import (
     ApiCreds,
     AssetType,
     BalanceAllowanceParams,
+    MarketOrderArgs,
     OpenOrderParams,
     OrderArgs,
     OrderType,
@@ -183,6 +184,46 @@ class AuthenticatedCLOBClient:
                 logger.debug("Failed to place order (no orderbook): %s", e)
             else:
                 logger.error("Failed to place order: %s", e)
+            return None
+
+    async def place_market_buy_fak(
+        self,
+        token_id: str,
+        amount_usdc: float,
+        max_price: float,
+    ) -> dict | None:
+        """Place an immediate-or-cancel style BUY using Polymarket FAK.
+
+        For CLOB market BUY orders, ``amount`` is USDC to spend and ``price`` is
+        the worst acceptable fill price. FAK takes available liquidity
+        immediately and cancels anything unfilled.
+        """
+        try:
+            client = await asyncio.to_thread(self._get_client)
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=amount_usdc,
+                side=SIDE_BUY,
+                price=max_price,
+                order_type=OrderType.FAK,
+            )
+
+            logger.debug(
+                "Placing FAK BUY: token=%s amount=$%.2f max_price=%.4f",
+                token_id[:16],
+                amount_usdc,
+                max_price,
+            )
+            order = await asyncio.to_thread(client.create_market_order, order_args)
+            result = await asyncio.to_thread(client.post_order, order, OrderType.FAK)
+            return result if isinstance(result, dict) else {"raw": result}
+
+        except Exception as e:
+            msg = str(e)
+            if "orderbook" in msg and "does not exist" in msg:
+                logger.debug("Failed to place FAK BUY (no orderbook): %s", e)
+            else:
+                logger.error("Failed to place FAK BUY: %s", e)
             return None
 
     async def cancel_order(self, order_id: str) -> bool:

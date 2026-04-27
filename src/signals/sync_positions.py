@@ -11,20 +11,17 @@ For each watch-whale's open weather position, every 30 seconds:
   8. Gate on midpoint vs whale_avg:
      - midpoint > whale_avg × 1.05  → SKIP slippage_above_5pct
      - midpoint < whale_avg × 0.80  → SKIP stale_below_20pct
-  9. In-band pricing: TAKE the ask if ask ≤ whale_avg × 1.05 (marketable limit).
-     Otherwise fall back to passive mid+1 tick, capped at whale_avg × 1.05.
-     The taker path exists because passive posts never fill in wide-spread markets
-     (every cycle cancels after 30s, producing lots of attempts but no fills).
- 10. Place a limit BUY at that price for `gap` contracts. Order lives at most 30s —
-     next cycle will cancel it if still unfilled and re-decide with fresh book data."""
+  9. In-band pricing: submit a real FAK taker BUY if ask liquidity is available
+     within whale_avg × 1.05.
+ 10. Never leave whale-copy BUYs resting on the book; FAK fills immediately or
+     cancels the unfilled remainder."""
 
 import asyncio
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select, and_, func, update, tuple_
 from sqlalchemy.dialects.postgresql import insert
@@ -36,15 +33,26 @@ from src.execution.order_manager import (
     cancel_order,
     get_order_status,
     place_order,
+    place_taker_buy,
     quantize_order_price,
 )
 from src.indexer.market_ingester import ensure_market
-from src.indexer.market_classifier import classify_market
 from src.indexer.wallet_ingester import ingest_wallet
 from src.models import CopyDecision, Market, MarketToken, MyTrade, WhalePosition, WhaleTrade
 from src.polymarket.clob_client import CLOBClient
 from src.polymarket.data_api import DataAPIClient, Position
 from src.polymarket.polynode_wallet_ws import WhaleTradeEvent, persist_whale_trade_event
+from src.signals.weather_resolution import (
+    MONTH_ABBR,
+    effective_market_category,
+    extract_weather_city,
+    extract_weather_date,
+    is_generic_weather_end_time,
+    is_weather_market,
+    parse_dt,
+    weather_local_date_gate,
+    weather_local_resolution_cutoff,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,60 +72,8 @@ _CITY_ABBR = {
     "San Francisco": "SF", "Los Angeles": "LA",
     "Washington D.C.": "DC", "Washington DC": "DC",
 }
-_MONTH_ABBR = {
-    "January": "Jan", "February": "Feb", "March": "Mar", "April": "Apr",
-    "May": "May", "June": "Jun", "July": "Jul", "August": "Aug",
-    "September": "Sep", "October": "Oct", "November": "Nov", "December": "Dec",
-}
-_MONTH_NUM = {month: i for i, month in enumerate(_MONTH_ABBR, start=1)}
-
-# Polymarket daily weather questions resolve by the named city's local weather date.
-# Gamma often exposes a generic 12:00 UTC endDate for these markets, which is too
-# early for same-day copying. This map is deliberately limited to weather cities
-# observed in the watched-wallet universe and common Polymarket weather venues.
-_WEATHER_CITY_TIMEZONES = {
-    "Atlanta": "America/New_York",
-    "Buenos Aires": "America/Argentina/Buenos_Aires",
-    "Chengdu": "Asia/Shanghai",
-    "Denver": "America/Denver",
-    "Hong Kong": "Asia/Hong_Kong",
-    "Jakarta": "Asia/Jakarta",
-    "Karachi": "Asia/Karachi",
-    "Kuala Lumpur": "Asia/Kuala_Lumpur",
-    "Lagos": "Africa/Lagos",
-    "Los Angeles": "America/Los_Angeles",
-    "Madrid": "Europe/Madrid",
-    "Miami": "America/New_York",
-    "Milan": "Europe/Rome",
-    "New York": "America/New_York",
-    "New York City": "America/New_York",
-    "Paris": "Europe/Paris",
-    "San Francisco": "America/Los_Angeles",
-    "Seattle": "America/Los_Angeles",
-    "Singapore": "Asia/Singapore",
-    "Tel Aviv": "Asia/Jerusalem",
-    "Toronto": "America/Toronto",
-    "Washington D.C.": "America/New_York",
-    "Washington DC": "America/New_York",
-}
-
-
 def _parse_dt(value) -> datetime | None:
-    if isinstance(value, datetime):
-        dt = value
-    elif value:
-        try:
-            text = str(value)
-            if len(text) == 10 and text[4] == "-" and text[7] == "-":
-                return None
-            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        except (TypeError, ValueError):
-            return None
-    else:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    return parse_dt(value)
 
 
 def _candidate_resolution_time(market: Market | None, pos: Position) -> datetime | None:
@@ -167,40 +123,14 @@ def _mkt_tag(title: str | None, outcome: str, end_date: str | None) -> str:
     if len(ed) == 10:
         try:
             dt = datetime.fromisoformat(ed)
-            date_tag = f"{_MONTH_ABBR.get(dt.strftime('%B'), dt.strftime('%b'))}{dt.day}"
+            date_tag = f"{MONTH_ABBR.get(dt.strftime('%B'), dt.strftime('%b'))}{dt.day}"
         except Exception:
             date_tag = ed
     return f"{city} {temp} {outcome} {date_tag}".strip()
 
 
 def _weather_local_resolution_cutoff(market: Market | None, pos: Position) -> datetime | None:
-    """Return end of the named city's local weather date, converted to UTC.
-
-    Daily weather markets are tradable during the weather date in the named
-    city. The stored Gamma endDate is often 12:00 UTC and should not cause
-    same-day weather candidates to be skipped before that local day has ended.
-    """
-    title = getattr(market, "question", None) or getattr(pos, "title", None) or ""
-    if _effective_market_category(market, title) != "weather" or not title:
-        return None
-
-    city = _extract_weather_city(title)
-    if not city:
-        return None
-    tz_name = _WEATHER_CITY_TIMEZONES.get(city)
-    if not tz_name:
-        return None
-
-    market_date = _extract_weather_date(title, pos, market)
-    if market_date is None:
-        return None
-
-    try:
-        local_tz = ZoneInfo(tz_name)
-    except ZoneInfoNotFoundError:
-        return None
-    local_cutoff = datetime.combine(market_date + timedelta(days=1), time.min, tzinfo=local_tz)
-    return local_cutoff.astimezone(timezone.utc)
+    return weather_local_resolution_cutoff(market, pos)
 
 
 def _weather_local_date_gate(
@@ -208,90 +138,27 @@ def _weather_local_date_gate(
     pos: Position,
     now_utc: datetime | None = None,
 ) -> tuple[bool, str, datetime | None] | None:
-    """Gate daily weather markets by the named city's local calendar date.
-
-    Same-day and future-date markets remain eligible. Past local-date markets
-    are stale reconciliation rows from the Data API and should be quiet.
-    """
-    if not _is_weather_market(market):
-        return None
-
-    title = getattr(market, "question", None) or getattr(pos, "title", None) or ""
-    city = _extract_weather_city(title)
-    if not city:
-        return None
-    tz_name = _WEATHER_CITY_TIMEZONES.get(city)
-    if not tz_name:
-        return None
-    market_date = _extract_weather_date(title, pos, market)
-    if market_date is None:
-        return None
-
-    try:
-        local_tz = ZoneInfo(tz_name)
-    except ZoneInfoNotFoundError:
-        return None
-
-    now = _parse_dt(now_utc) or datetime.now(timezone.utc)
-    now_local_date = now.astimezone(local_tz).date()
-    local_cutoff = datetime.combine(market_date + timedelta(days=1), time.min, tzinfo=local_tz)
-    cutoff_utc = local_cutoff.astimezone(timezone.utc)
-    if now_local_date > market_date:
-        return False, "stale_past_resolution", cutoff_utc
-    return True, "weather_local_date_active", cutoff_utc
+    return weather_local_date_gate(market, pos, now_utc)
 
 
 def _is_weather_market(market: Market | None) -> bool:
-    return _effective_market_category(market) == "weather"
+    return is_weather_market(market)
 
 
 def _effective_market_category(market: Market | None, fallback_title: str | None = None) -> str | None:
-    category = getattr(market, "category_override", None) or getattr(market, "category", None)
-    if category == "weather":
-        return "weather"
-    title = getattr(market, "question", None) or fallback_title or ""
-    if title and classify_market(title).category == "weather":
-        return "weather"
-    return category
+    return effective_market_category(market, fallback_title)
 
 
 def _is_generic_weather_end_time(dt: datetime | None) -> bool:
-    return bool(dt and dt.hour == 12 and dt.minute == 0 and dt.second == 0)
+    return is_generic_weather_end_time(dt)
 
 
 def _extract_weather_city(title: str) -> str | None:
-    match = re.search(r"temperature in ([^?]+?) be ", title)
-    if not match:
-        return None
-    return match.group(1).strip()
+    return extract_weather_city(title)
 
 
-def _extract_weather_date(title: str, pos: Position, market: Market | None) -> date | None:
-    pos_dt = _parse_dt(getattr(pos, "end_date", None))
-    if pos_dt is not None:
-        return pos_dt.date()
-
-    end_text = str(getattr(pos, "end_date", "") or "")
-    if len(end_text) >= 10 and end_text[4] == "-" and end_text[7] == "-":
-        try:
-            return date.fromisoformat(end_text[:10])
-        except ValueError:
-            pass
-
-    match = re.search(
-        r"\bon (January|February|March|April|May|June|July|August|September|October|November|December) (\d{1,2})\b",
-        title,
-    )
-    if not match:
-        return None
-
-    year_source = _parse_dt(getattr(market, "resolution_time", None)) or datetime.now(timezone.utc)
-    month = _MONTH_NUM[match.group(1)]
-    day = int(match.group(2))
-    try:
-        return date(year_source.year, month, day)
-    except ValueError:
-        return None
+def _extract_weather_date(title: str, pos: Position, market: Market | None):
+    return extract_weather_date(title, pos, market)
 
 
 def _whale_position_notional(whale_size: int, whale_avg: float) -> float:
@@ -974,30 +841,40 @@ async def _evaluate_position(
             )
         return await finish("slippage_above", "slippage_above_5pct", filled_contracts=filled_contracts)
 
-    # In the band: prefer to TAKE the ask (cross the spread) when it's within our cap —
-    # passive mid+1t posts don't fill in wide-spread markets (all cycle-expire after 30s).
-    # Fall back to passive pricing only when the ask is above max_bid.
-    if ask is not None and ask <= max_bid:
-        bid_price = ask
-        price_reason = "ask_taker"
-    else:
-        bid_price = min(mid + 0.01, max_bid)
-        price_reason = "mid+1t" if bid_price < max_bid else "max_bid"
+    # In band: use a real FAK taker. If no ask exists inside the cap, do not
+    # leave a passive whale-copy order resting on the book.
+    if ask is None or ask <= 0:
+        if _note_decision(addr, pos.condition_id, outcome, "SKIP:no_valid_price:no_ask"):
+            logger.info("SYNC: %s | gap %d contracts | SKIP no_valid_price:no_ask", mkt_tag, gap_contracts)
+        return await finish("NO_VALID_PRICE", "no_ask", filled_contracts=filled_contracts)
+    if ask > max_bid:
+        if _note_decision(addr, pos.condition_id, outcome, f"SKIP:slippage_above_ask:{ask:.3f}"):
+            logger.info(
+                "SYNC: %s | gap %d contracts | ask %.3f > %.3f × 1.05 = %.3f → SKIP slippage_above_ask",
+                mkt_tag, gap_contracts, ask, whale_avg, max_bid,
+            )
+        return await finish("slippage_above", "ask_above_slippage_cap", filled_contracts=filled_contracts)
+
+    bid_price = ask
+    price_reason = "FAK_TAKER"
     order_price = quantize_order_price(bid_price, "BUY")
+    max_price = quantize_order_price(max_bid, "BUY")
     decision_context.update(
         {
             "bid_price": round(bid_price, 6),
             "order_price": round(order_price, 6),
+            "max_price": round(max_price, 6),
             "price_reason": price_reason,
+            "order_type": "FAK",
         }
     )
-    if order_price < MIN_ORDER_PRICE:
-        if _note_decision(addr, pos.condition_id, outcome, f"SKIP:price_below_tick:{bid_price:.6f}"):
+    if order_price < MIN_ORDER_PRICE or max_price < MIN_ORDER_PRICE:
+        if _note_decision(addr, pos.condition_id, outcome, f"SKIP:no_valid_price:{bid_price:.6f}"):
             logger.info(
-                "SYNC: %s | bid %.6f rounds below CLOB min tick %.3f → SKIP price_below_tick",
+                "SYNC: %s | taker price %.6f rounds below CLOB min tick %.3f → SKIP no_valid_price",
                 mkt_tag, bid_price, MIN_ORDER_PRICE,
             )
-        return await finish("price_below_tick", requested_contracts=gap_contracts, filled_contracts=filled_contracts)
+        return await finish("NO_VALID_PRICE", "price_below_tick", requested_contracts=gap_contracts, filled_contracts=filled_contracts)
 
     # Per-market concentration cap — size down the order if placing it would push
     # this position beyond MAX_POSITION_FRAC_OF_WALLET of wallet USDC.
@@ -1051,33 +928,70 @@ async def _evaluate_position(
             logger.info("SYNC: %s | order notional under CLOB $1 min → SKIP", mkt_tag)
         return await finish("under_min", "under_min_notional", requested_contracts=contracts, filled_contracts=filled_contracts)
 
+    taker_amount_usdc = round(min(contracts * order_price, MAX_ORDER_USDC, allowed_additional_usdc), 2)
+    decision_context["taker_amount_usdc"] = taker_amount_usdc
+    if taker_amount_usdc < MIN_NOTIONAL_USDC:
+        if _note_decision(addr, pos.condition_id, outcome, "SKIP:under_min_notional"):
+            logger.info("SYNC: %s | FAK amount $%.2f under CLOB $1 min → SKIP", mkt_tag, taker_amount_usdc)
+        return await finish("under_min", "under_min_notional", requested_contracts=contracts, filled_contracts=filled_contracts)
+
     if settings.live_execution_enabled:
-        order_id = await place_order(
+        taker_result = await place_taker_buy(
             token_id=token.token_id,
-            side="BUY",
-            price=order_price,
-            size=float(contracts),
+            amount_usdc=taker_amount_usdc,
+            max_price=max_price,
             tag=mkt_tag,
         )
         mode = "LIVE"
+        order_id = taker_result.order_id
+        immediate_fill_contracts = taker_result.filled_contracts
+        avg_fill_price = taker_result.avg_fill_price or order_price
+        decision_context.update(
+            {
+                "fak_status": taker_result.status,
+                "fak_error": taker_result.error,
+                "fak_response": taker_result.raw_response,
+                "fak_order_status": taker_result.raw_status,
+                "fak_filled_contracts": immediate_fill_contracts,
+            }
+        )
+        if taker_result.error and not taker_result.accepted:
+            if taker_result.error == "place_failed":
+                if _note_decision(addr, pos.condition_id, outcome, "SKIP:place_failed"):
+                    logger.warning("SYNC: %s | gap %d contracts | FAK placement failed", mkt_tag, contracts)
+                return await finish("place_failed", requested_contracts=contracts, filled_contracts=0)
+            if _note_decision(addr, pos.condition_id, outcome, f"SKIP:FAK_REJECTED:{taker_result.error}"):
+                logger.warning("SYNC: %s | FAK rejected: %s", mkt_tag, taker_result.error)
+            return await finish("FAK_REJECTED", taker_result.error, requested_contracts=contracts, filled_contracts=0)
     else:
-        order_id = f"paper_{int(datetime.now(timezone.utc).timestamp() * 1000)}_{pos.condition_id[:8]}"
+        order_id = f"paper_fak_{int(datetime.now(timezone.utc).timestamp() * 1000)}_{pos.condition_id[:8]}"
         mode = "PAPER"
+        immediate_fill_contracts = contracts
+        avg_fill_price = order_price
 
     if not order_id:
         if _note_decision(addr, pos.condition_id, outcome, "SKIP:place_failed"):
-            logger.warning("SYNC: %s | gap %d contracts | order placement failed (likely no orderbook)", mkt_tag, contracts)
-        return await finish("place_failed", requested_contracts=contracts, filled_contracts=filled_contracts)
+            logger.warning("SYNC: %s | gap %d contracts | FAK placement failed", mkt_tag, contracts)
+        return await finish("place_failed", requested_contracts=contracts, filled_contracts=0)
 
-    size_usdc = round(contracts * order_price, 2)
+    fill_status = "FILLED"
+    if immediate_fill_contracts <= 0:
+        fill_status = "CANCELLED"
+        actual_contracts = 0
+        size_usdc = 0.0
+    else:
+        actual_contracts = immediate_fill_contracts
+        fill_status = "FILLED" if immediate_fill_contracts >= contracts else "PARTIAL"
+        size_usdc = round(actual_contracts * avg_fill_price, 2)
+
     trade = MyTrade(
         condition_id=pos.condition_id,
         outcome=outcome,
-        entry_price=Decimal(str(round(order_price, 6))),
+        entry_price=Decimal(str(round(avg_fill_price, 6))),
         size_usdc=Decimal(str(size_usdc)),
-        num_contracts=contracts,
+        num_contracts=actual_contracts,
         order_id=order_id,
-        fill_status="FILLED" if mode == "PAPER" else "PENDING",
+        fill_status=fill_status,
         entry_timestamp=datetime.now(timezone.utc),
         source_wallets=[addr],
         attribution={
@@ -1087,8 +1001,10 @@ async def _evaluate_position(
             "low_avg_price": whale_avg < LOW_PRICE_OBSERVATION,
             "bid_price": str(round(bid_price, 6)),
             "order_price": str(round(order_price, 6)),
+            "max_price": str(round(max_price, 6)),
             "midpoint": str(round(mid, 6)),
             "price_reason": price_reason,
+            "order_type": "FAK",
             "whale_size": whale_size,
             "target_contracts": target_contracts,
             "max_target_contracts": max_target_contracts,
@@ -1096,7 +1012,8 @@ async def _evaluate_position(
             "reserved_pending_contracts": reserved_contracts,
             "effective_copied_contracts": effective_contracts,
             "requested_contracts": contracts,
-            "requested_size_usdc": str(size_usdc),
+            "requested_size_usdc": str(taker_amount_usdc),
+            "immediate_fill_contracts": immediate_fill_contracts,
             "size_fraction": settings.position_size_fraction,
             "category": "weather",
             "execution_mode": mode,
@@ -1107,15 +1024,26 @@ async def _evaluate_position(
     await session.flush()
     _LAST_DECISION.pop((addr, pos.condition_id, outcome), None)
     logger.info(
-        "SYNC: %s | whale_avg %.3f, mid %.3f | filled %d reserved %d effective %d / target %d max %d | gap %d → BUY %d @ %.4f (%s) [%s]",
+        "SYNC: %s | whale_avg %.3f, mid %.3f | filled %d reserved %d effective %d / target %d max %d | gap %d → FAK BUY $%.2f max %.4f filled %d/%d [%s]",
         mkt_tag, whale_avg, mid, filled_contracts, reserved_contracts, effective_contracts, target_contracts, max_target_contracts, gap_contracts,
-        contracts, order_price, price_reason, mode,
+        taker_amount_usdc, max_price, immediate_fill_contracts, contracts, mode,
     )
+    if immediate_fill_contracts <= 0:
+        return await finish(
+            "FAK_NO_FILL",
+            "fak_no_immediate_fill",
+            requested_contracts=contracts,
+            filled_contracts=0,
+            order_ids=[order_id],
+            my_trade_id=trade.id,
+            order_notional_usdc=taker_amount_usdc,
+            execution_mode=mode,
+        )
     return await finish(
         "BUY",
-        "order_placed",
+        "fak_filled" if fill_status == "FILLED" else "fak_partial",
         requested_contracts=contracts,
-        filled_contracts=filled_contracts,
+        filled_contracts=immediate_fill_contracts,
         order_ids=[order_id],
         my_trade_id=trade.id,
         order_notional_usdc=size_usdc,
