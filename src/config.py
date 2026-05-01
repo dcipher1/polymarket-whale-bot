@@ -1,5 +1,7 @@
-from pydantic_settings import BaseSettings
-from pydantic import Field
+from typing import Annotated
+
+from pydantic_settings import BaseSettings, NoDecode
+from pydantic import Field, field_validator
 
 
 class Settings(BaseSettings):
@@ -63,7 +65,7 @@ class Settings(BaseSettings):
     max_slippage_pct: float = 0.05  # 5% above whale avg entry price
     max_absolute_slippage: float = 0.15  # legacy, unused
     min_edge_threshold: float = 0.02
-    max_entry_price: float = 0.95  # don't buy effectively-resolved markets
+    max_entry_price: float = 0.90  # don't buy effectively-resolved markets
     min_entry_price: float = 0.10  # don't buy extreme-longshot markets
     max_entry_price_trade: float = 0.90  # don't buy near-resolved markets
 
@@ -75,14 +77,27 @@ class Settings(BaseSettings):
     # fill with the originating whale so we can break PnL down per-whale.
     watch_whales: list[str] = [
         "0x8aa29c27241b6909a7c4d6cb4f400267aa215a0b",   # US weather, multi-bucket directional + partial hedges
-        "0x0eeea56c3509e68fb655d0a2ddadc303957274e8",   # Steady YES-side, never-negative equity curve
-        "0x9c68b13a2c9b6d2e80826f26cea746cc22ba7936",   # International weather (Jakarta, Karachi, Singapore, Lagos)
+        "0x9c68b13a2c9b6d2e80826f26cea746cc22ba7936",   # International weather (Jakarta, Karachi, Singapore, Lagos) — fast_execution
+        "0xaa930fdc4caa3c0f6067404a7bd7899ca45f0bc7",   # 82% weather, slow accumulator, ~133 open low-price YES positions, +$12K all-time
+        "0x672fe5d8a7b946fa9bff1b902a44a56718a213cc",   # BA / Tel Aviv / Madrid weather, BUY-only, +$4.5k/month, median $19
     ]
 
     # Copy sizing — mirror a fraction of the whale's *share count* PER WHALE.
     # With 3 whales and overlap possible on same markets, 1.0 keeps combined exposure manageable.
-    # Each order is capped at $50 notional (MAX_ORDER_USDC in sync_positions.py).
+    # Each order is capped at $100 notional (MAX_ORDER_USDC in sync_positions.py).
     position_size_fraction: float = 1.0
+
+    # Per-whale sizing override. Multiplied into the global position_size_fraction
+    # so a value of 2.0 means we copy 2x that whale's share count. Addresses must
+    # be lowercase. The per-position 10% bankroll cap still applies as a backstop.
+    position_size_multipliers: dict[str, float] = {
+        "0x8aa29c27241b6909a7c4d6cb4f400267aa215a0b": 2.0,  # best copy whale, 2x
+    }
+
+    # Fast-execution whales — websocket-driven BUYs from these wallets bypass
+    # the whale_avg×1.05 slippage band and bid up to FAST_MAX_PRICE with a
+    # FAST_MAX_ORDER_USDC nibble. Env: FAST_EXECUTION_WHALES (comma-separated).
+    fast_execution_whales: Annotated[list[str], NoDecode] = []
 
     # Wallet freshness
     wallet_stale_days: int = 7
@@ -178,6 +193,15 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
+    @field_validator("fast_execution_whales", mode="before")
+    @classmethod
+    def _parse_fast_execution_whales(cls, v):
+        if isinstance(v, str):
+            return [w.strip().lower() for w in v.split(",") if w.strip()]
+        if isinstance(v, list):
+            return [str(w).strip().lower() for w in v if str(w).strip()]
+        return v or []
 
     _SENSITIVE_FIELDS = {
         "polymarket_private_key", "polymarket_api_key", "polymarket_api_secret",

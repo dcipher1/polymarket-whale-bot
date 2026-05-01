@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -190,7 +190,7 @@ async def _upsert_trade(session: AsyncSession, wallet_address: str, trade: Trade
         await _backlog_trade(session, wallet_address, trade, condition_id, token_id, outcome, side, "token_mapping_conflict")
         return False
 
-    stmt = insert(WhaleTrade).values(
+    insert_stmt = insert(WhaleTrade).values(
         wallet_address=wallet_address,
         condition_id=condition_id,
         token_id=token_id,
@@ -202,13 +202,30 @@ async def _upsert_trade(session: AsyncSession, wallet_address: str, trade: Trade
         timestamp=timestamp,
         tx_hash=tx_hash,
         detected_at=datetime.now(timezone.utc),
-    ).on_conflict_do_nothing(
-        constraint="uq_whale_trades_dedup"
     )
+    # Upsert (not do-nothing): PolyNode emits one event per individual fill within
+    # a multi-fill trade, so a row may already exist with a partial num_contracts /
+    # size_usdc. The data-api activity feed reports the aggregated total per
+    # tx_hash, which is the canonical truth — let it overwrite the partial.
+    stmt = insert_stmt.on_conflict_do_update(
+        constraint="uq_whale_trades_dedup",
+        set_={
+            "side": insert_stmt.excluded.side,
+            "outcome": insert_stmt.excluded.outcome,
+            "price": insert_stmt.excluded.price,
+            "size_usdc": insert_stmt.excluded.size_usdc,
+            "num_contracts": insert_stmt.excluded.num_contracts,
+            "timestamp": insert_stmt.excluded.timestamp,
+        },
+    # xmax=0 only for fresh inserts, so we can distinguish "newly seen trade"
+    # (publish event) from "ingester reconciled a partial-fill row" (silent).
+    ).returning(WhaleTrade.__table__.c.tx_hash, text("(xmax = 0)"))
 
     try:
         result = await session.execute(stmt)
-        is_new = result.rowcount > 0
+        row = result.first()
+        # row[0] = tx_hash, row[1] = (xmax = 0) — True for inserts, False for updates.
+        is_new = bool(row[1]) if row is not None else False
     except Exception:
         await session.rollback()
         return False

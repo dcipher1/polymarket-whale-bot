@@ -1,26 +1,30 @@
-"""Unified 30s copy-trader loop.
+"""Copy-trader loop for the watch-whales.
 
-For each watch-whale's open weather position, every 30 seconds:
-  1. Refresh status of any in-flight orders (capture recent fills).
-  2. Cancel any remaining PENDING orders (active 30s expiry — no stale bids).
-  3. Compute target_contracts = whale.size × position_size_fraction.
-  4. Treat filled plus live pending requests as copied exposure.
-  5. If exposure is already at target, hold; if it is over the 5% buffer, block more buys.
-  6. If the remaining gap is below the CLOB minimum, skip as under_min_notional.
-  7. Fetch book (bid + ask). Compute midpoint.
-  8. Gate on midpoint vs whale_avg:
+The PolyNode wallet websocket drives the hot path; this fallback poll runs
+every wallet_sync_fallback_interval_seconds (currently 300s / 5 min) to
+catch BUYs the websocket missed during reconnects or outages. For each
+watch-whale's open weather position the loop:
+
+  1. Refreshes status of any in-flight orders (capture recent fills).
+  2. Cancels any remaining PENDING orders.
+  3. Computes target_contracts = whale.size × position_size_fraction.
+  4. Treats filled plus live pending requests as copied exposure.
+  5. If exposure is already at target, holds; if over the 5% buffer, blocks more buys.
+  6. If the remaining gap is below the CLOB minimum, skips as under_min_notional.
+  7. Fetches book (bid + ask) and computes midpoint.
+  8. Gates on midpoint vs whale_avg:
      - midpoint > whale_avg × 1.05  → SKIP slippage_above_5pct
      - midpoint < whale_avg × 0.80  → SKIP stale_below_20pct
-  9. In-band pricing: submit a real FAK taker BUY if ask liquidity is available
-     within whale_avg × 1.05.
- 10. Never leave whale-copy BUYs resting on the book; FAK fills immediately or
-     cancels the unfilled remainder."""
+  9. In-band pricing: submits a real FAK taker BUY if ask liquidity is
+     available within whale_avg × 1.05.
+ 10. Never leaves whale-copy BUYs resting on the book; FAK fills immediately
+     or cancels the unfilled remainder."""
 
 import asyncio
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import select, and_, func, update, tuple_
@@ -29,6 +33,7 @@ from sqlalchemy.dialects.postgresql import insert
 from src.config import settings
 from src.db import async_session
 from src.execution.order_manager import (
+    MAX_ORDER_PRICE,
     MIN_ORDER_PRICE,
     cancel_order,
     get_order_status,
@@ -61,7 +66,9 @@ MIN_ORDER_CONTRACTS = 5    # CLOB rejects orders smaller than 5 contracts.
 FLOOR_FRAC = 0.80          # Skip if midpoint < whale_avg * FLOOR_FRAC (20% floor — thesis broken).
 CEILING_FRAC = 1.05        # Allow bidding up to whale_avg * CEILING_FRAC (5% above — capture winners).
 MAX_POSITION_FRAC_OF_WALLET = 0.10  # No single position > 10% of wallet USDC.
-MAX_ORDER_USDC = 50.0      # Nibble cap — no single order larger than $50 notional.
+MAX_ORDER_USDC = 100.0     # Nibble cap — no single order larger than $100 notional.
+FAST_MAX_PRICE = 0.90      # Fast-execution absolute price ceiling (settings.fast_execution_whales).
+FAST_MAX_ORDER_USDC = 100.0  # Fast-execution per-order nibble ($100 vs default $50).
 LOW_PRICE_OBSERVATION = 0.10  # Log low average entries, but do not hard-skip real aggregate positions.
 COPY_TARGET_BUFFER_FRAC = 1.05  # Allow only 5% above the watched whale's visible size.
 TERMINAL_FILL = {"FILLED", "PARTIAL"}
@@ -161,7 +168,7 @@ def _extract_weather_date(title: str, pos: Position, market: Market | None):
     return extract_weather_date(title, pos, market)
 
 
-def _whale_position_notional(whale_size: int, whale_avg: float) -> float:
+def _whale_position_notional(whale_size: float, whale_avg: float) -> float:
     return max(0.0, whale_size * whale_avg)
 
 
@@ -221,12 +228,45 @@ async def _upsert_open_whale_position_from_api(
     return True
 
 
+# Per-whale counter of consecutive empty Data API responses. We only mass-close
+# absent positions after the second empty cycle, so a single transient API
+# outage does not silently mark every tracked position CLOSE.
+_CONSECUTIVE_EMPTY_POLLS: dict[str, int] = {}
+EMPTY_POLL_CONFIRMATION_CYCLES = 2
+
+
 async def _close_absent_whale_positions(
     session,
     addr: str,
     open_keys: set[tuple[str, str]],
 ) -> int:
     """Close DB whale positions absent from the latest Data API open snapshot."""
+    if not open_keys:
+        # Treat empty as suspect (likely a transient API outage). Require
+        # EMPTY_POLL_CONFIRMATION_CYCLES consecutive empty polls before closing.
+        count = _CONSECUTIVE_EMPTY_POLLS.get(addr, 0) + 1
+        _CONSECUTIVE_EMPTY_POLLS[addr] = count
+        if count < EMPTY_POLL_CONFIRMATION_CYCLES:
+            logger.info(
+                "SYNC: %s empty positions response (%d/%d) — deferring mass-close",
+                addr[:10], count, EMPTY_POLL_CONFIRMATION_CYCLES,
+            )
+            return 0
+        # WARN once on the cycle that mass-closes; then heartbeat every ~60h
+        # (720 cycles × ~5 min). Intermediate cycles are DEBUG to keep the log clean.
+        if count == EMPTY_POLL_CONFIRMATION_CYCLES or count % 720 == 0:
+            logger.warning(
+                "SYNC: %s %d consecutive empty positions responses — closing all DB rows",
+                addr[:10], count,
+            )
+        else:
+            logger.debug(
+                "SYNC: %s %d consecutive empty positions responses (still empty)",
+                addr[:10], count,
+            )
+    else:
+        _CONSECUTIVE_EMPTY_POLLS.pop(addr, None)
+
     stmt = update(WhalePosition).where(
         WhalePosition.wallet_address == addr,
         WhalePosition.is_open == True,
@@ -268,8 +308,6 @@ async def _mark_whale_position_closed(
 # Suppress repeat logging of the same decision on the same (addr, cid, outcome).
 _LAST_DECISION: dict[tuple[str, str, str], str] = {}
 _LAST_HEALTH_ALERT_COUNT: int | None = None
-_LAST_STALE_DECISION_RECORD: dict[tuple[str, str, str, str], datetime] = {}
-STALE_DECISION_RECORD_INTERVAL = timedelta(hours=1)
 
 
 @dataclass(frozen=True)
@@ -290,10 +328,10 @@ class CopyTarget:
     buffered_gap_contracts: int
 
 
-def _copy_target(whale_size: float, effective_contracts: int) -> CopyTarget:
-    target_contracts = int(round(whale_size * settings.position_size_fraction))
-    max_target_contracts = int(whale_size * settings.position_size_fraction * COPY_TARGET_BUFFER_FRAC)
-    max_target_contracts = max(target_contracts, max_target_contracts)
+def _copy_target(whale_size: float, effective_contracts: int, multiplier: float = 1.0) -> CopyTarget:
+    scaled = whale_size * settings.position_size_fraction * multiplier
+    target_contracts = int(round(scaled))
+    max_target_contracts = max(target_contracts, int(scaled * COPY_TARGET_BUFFER_FRAC))
     return CopyTarget(
         target_contracts=target_contracts,
         max_target_contracts=max_target_contracts,
@@ -308,26 +346,6 @@ def _note_decision(addr: str, cid: str, outcome: str, signature: str) -> bool:
     if prev == signature:
         return False
     _LAST_DECISION[key] = signature
-    return True
-
-
-def _should_record_copy_decision(
-    decision_source: str,
-    addr: str,
-    cid: str,
-    outcome: str,
-    code: str,
-    now: datetime | None = None,
-) -> bool:
-    """Throttle repetitive fallback decisions for stale historical positions."""
-    if decision_source != "fallback_poll" or code not in {"stale_past_resolution", "past_resolution_time"}:
-        return True
-    now = now or datetime.now(timezone.utc)
-    key = (addr, cid, outcome, code)
-    last = _LAST_STALE_DECISION_RECORD.get(key)
-    if last is not None and now - last < STALE_DECISION_RECORD_INTERVAL:
-        return False
-    _LAST_STALE_DECISION_RECORD[key] = now
     return True
 
 
@@ -498,6 +516,16 @@ async def _refresh_inflight(session, trade: MyTrade) -> None:
 
     status = await get_order_status(trade.order_id)
     if not status:
+        # Freshly-placed FAKs may not be indexed by Polymarket yet. Don't
+        # mark CANCELLED until the trade is old enough that a missing order
+        # is genuine (rejected/purged) rather than just slow propagation.
+        age = datetime.now(timezone.utc) - (trade.entry_timestamp or datetime.now(timezone.utc))
+        if age.total_seconds() < 60:
+            logger.info(
+                "Trade %d: CLOB has no record of %s yet (age %.0fs) — leaving PENDING",
+                trade.id, trade.order_id[:16], age.total_seconds(),
+            )
+            return
         _mark_cancelled_zero_fill(trade)
         logger.info("Trade %d: CLOB has no record of %s — marking CANCELLED",
                     trade.id, trade.order_id[:16])
@@ -578,11 +606,19 @@ async def _evaluate_position(
     so the caller can tally a per-cycle summary.
     """
     outcome = (pos.outcome or "").upper()
+    fast_mode = (
+        decision_source == "websocket"
+        and addr.lower() in {w.lower() for w in (settings.fast_execution_whales or [])}
+    )
+    nibble_cap_usdc = FAST_MAX_ORDER_USDC if fast_mode else MAX_ORDER_USDC
+    size_multiplier = settings.position_size_multipliers.get(addr.lower(), 1.0)
     decision_context = {
         "wallet_usdc": round(wallet_usdc, 6),
         "allow_new_buys": allow_new_buys,
         "position_size_fraction": settings.position_size_fraction,
-        "max_order_usdc": MAX_ORDER_USDC,
+        "size_multiplier": size_multiplier,
+        "max_order_usdc": nibble_cap_usdc,
+        "fast_mode": fast_mode,
     }
 
     async def finish(
@@ -596,28 +632,30 @@ async def _evaluate_position(
     ) -> str:
         context = dict(decision_context)
         context.update(extra)
-        if _should_record_copy_decision(decision_source, addr, pos.condition_id, outcome, code):
-            await _record_copy_decision(
-                session,
-                wallet_address=addr,
-                condition_id=pos.condition_id,
-                outcome=outcome if outcome in {"YES", "NO"} else None,
-                decision_code=code,
-                decision_reason=reason,
-                decision_source=decision_source,
-                whale_trade_id=whale_trade_id,
-                event_timestamp=event_timestamp,
-                detected_at=detected_at,
-                requested_contracts=requested_contracts,
-                filled_contracts=filled_contracts,
-                order_ids=order_ids,
-                context=context,
-            )
+        await _record_copy_decision(
+            session,
+            wallet_address=addr,
+            condition_id=pos.condition_id,
+            outcome=outcome if outcome in {"YES", "NO"} else None,
+            decision_code=code,
+            decision_reason=reason,
+            decision_source=decision_source,
+            whale_trade_id=whale_trade_id,
+            event_timestamp=event_timestamp,
+            detected_at=detected_at,
+            requested_contracts=requested_contracts,
+            filled_contracts=filled_contracts,
+            order_ids=order_ids,
+            context=context,
+        )
         return code
 
     if outcome not in ("YES", "NO") or not pos.condition_id:
         return await finish("invalid", "invalid_outcome_or_condition")
-    whale_size = int(_f(pos.size))
+    # Keep whale_size as float — fractional positions (e.g. 0.28 contracts) are
+    # legitimate; downstream gates (under_min_contracts) will skip too-small
+    # whales with a clearer reason than "whale_empty".
+    whale_size = _f(pos.size)
     whale_avg = _f(pos.avg_price)
     decision_context.update(
         {
@@ -715,7 +753,7 @@ async def _evaluate_position(
     filled_contracts = exposure.filled_contracts
     reserved_contracts = exposure.reserved_pending_contracts
     effective_contracts = exposure.effective_contracts
-    copy_target = _copy_target(whale_size, effective_contracts)
+    copy_target = _copy_target(whale_size, effective_contracts, multiplier=size_multiplier)
     target_contracts = copy_target.target_contracts
     max_target_contracts = copy_target.max_target_contracts
     gap_contracts = copy_target.gap_contracts
@@ -770,7 +808,10 @@ async def _evaluate_position(
 
     max_allowed_notional = gap_contracts * whale_avg * CEILING_FRAC
     decision_context["max_allowed_notional"] = round(max_allowed_notional, 4)
-    if max_allowed_notional < MIN_NOTIONAL_USDC:
+    # Skip the gap-based notional floor for fast-track events: we override the
+    # contract count below to always fill the $100 nibble, so the real notional
+    # check happens post-override and an early skip here would short-circuit it.
+    if max_allowed_notional < MIN_NOTIONAL_USDC and not fast_mode:
         if _note_decision(
             addr,
             pos.condition_id,
@@ -821,19 +862,28 @@ async def _evaluate_position(
             logger.info("SYNC: %s | gap %d contracts | SKIP no_book", mkt_tag, gap_contracts)
         return await finish("no_book", filled_contracts=filled_contracts)
 
-    # Price band anchored to whale_avg — 5% ceiling above, 20% floor below.
-    max_bid = whale_avg * CEILING_FRAC
-    min_bid = whale_avg * FLOOR_FRAC
+    # Price band. Default: anchor to whale_avg (5% above / 20% below).
+    # Fast mode (websocket BUY from a fast_execution_whales wallet): bid up
+    # to FAST_MAX_PRICE regardless of whale_avg slippage. Skips the band and
+    # ask-cap gates so we chase whales whose own buy moves the book.
+    if fast_mode:
+        max_bid = FAST_MAX_PRICE
+        min_bid = 0.0
+    else:
+        # Hard ceiling at settings.max_entry_price — buying above this leaves
+        # too little upside vs. resolution risk regardless of the whale's avg.
+        max_bid = min(whale_avg * CEILING_FRAC, settings.max_entry_price)
+        min_bid = whale_avg * FLOOR_FRAC
     decision_context.update({"max_bid": round(max_bid, 6), "min_bid": round(min_bid, 6)})
 
-    if mid < min_bid:
+    if not fast_mode and mid < min_bid:
         if _note_decision(addr, pos.condition_id, outcome, f"SKIP:stale_below_20pct:{mid:.3f}"):
             logger.info(
                 "SYNC: %s | gap %d contracts | mid %.3f < %.3f × 0.80 = %.3f → SKIP stale_below_20pct",
                 mkt_tag, gap_contracts, mid, whale_avg, min_bid,
             )
         return await finish("stale_below", "stale_below_20pct", filled_contracts=filled_contracts)
-    if mid > max_bid:
+    if not fast_mode and mid > max_bid:
         if _note_decision(addr, pos.condition_id, outcome, f"SKIP:slippage_above_5pct:{mid:.3f}"):
             logger.info(
                 "SYNC: %s | gap %d contracts | mid %.3f > %.3f × 1.05 = %.3f → SKIP slippage_above_5pct",
@@ -850,15 +900,23 @@ async def _evaluate_position(
     if ask > max_bid:
         if _note_decision(addr, pos.condition_id, outcome, f"SKIP:slippage_above_ask:{ask:.3f}"):
             logger.info(
-                "SYNC: %s | gap %d contracts | ask %.3f > %.3f × 1.05 = %.3f → SKIP slippage_above_ask",
-                mkt_tag, gap_contracts, ask, whale_avg, max_bid,
+                "SYNC: %s | gap %d contracts | ask %.3f > cap %.3f → SKIP slippage_above_ask%s",
+                mkt_tag, gap_contracts, ask, max_bid, " [FAST]" if fast_mode else "",
             )
         return await finish("slippage_above", "ask_above_slippage_cap", filled_contracts=filled_contracts)
 
     bid_price = ask
     price_reason = "FAK_TAKER"
     order_price = quantize_order_price(bid_price, "BUY")
-    max_price = quantize_order_price(max_bid, "BUY")
+    # max_price is a ceiling — round outward so a between-ticks cap admits the
+    # adjacent tick instead of rejecting fills inside the caller's intended cap.
+    max_price = quantize_order_price(max_bid, "BUY", direction="outside")
+    # Clamp to CLOB upper bound. whale_avg×1.05 can exceed 0.999 when whale_avg
+    # is near 1.0 (a near-resolved market) — Polymarket rejects such orders as
+    # invalid_price. Cap the ceiling; if order_price itself is above the bound,
+    # we'll skip below.
+    if max_price > MAX_ORDER_PRICE:
+        max_price = MAX_ORDER_PRICE
     decision_context.update(
         {
             "bid_price": round(bid_price, 6),
@@ -875,10 +933,22 @@ async def _evaluate_position(
                 mkt_tag, bid_price, MIN_ORDER_PRICE,
             )
         return await finish("NO_VALID_PRICE", "price_below_tick", requested_contracts=gap_contracts, filled_contracts=filled_contracts)
+    if order_price > MAX_ORDER_PRICE:
+        if _note_decision(addr, pos.condition_id, outcome, f"SKIP:near_resolution:{bid_price:.6f}"):
+            logger.info(
+                "SYNC: %s | ask %.4f at/above CLOB max %.3f — market near resolution → SKIP near_resolution",
+                mkt_tag, bid_price, MAX_ORDER_PRICE,
+            )
+        return await finish("NO_VALID_PRICE", "price_above_max", requested_contracts=gap_contracts, filled_contracts=filled_contracts)
 
     # Per-market concentration cap — size down the order if placing it would push
     # this position beyond MAX_POSITION_FRAC_OF_WALLET of wallet USDC.
     contracts = min(gap_contracts, buffered_gap_contracts)
+    # Fast-track whale gets a flat $100 nibble per websocket event regardless of
+    # how small his actual buy was. The 10% per-position cap and the per-order
+    # nibble cap below are still backstops.
+    if fast_mode:
+        contracts = max(contracts, int(nibble_cap_usdc / order_price))
     position_cap_usdc = wallet_usdc * MAX_POSITION_FRAC_OF_WALLET
     current_exposure_usdc = exposure.effective_usdc
     allowed_additional_usdc = max(0.0, position_cap_usdc - current_exposure_usdc)
@@ -905,12 +975,13 @@ async def _evaluate_position(
         }
     )
 
-    # Per-order nibble cap: never place > $50 notional in one order.
-    per_order_cap_contracts = int(MAX_ORDER_USDC / order_price)
+    # Per-order nibble cap: never place > nibble_cap_usdc notional in one order.
+    per_order_cap_contracts = int(nibble_cap_usdc / order_price)
     if contracts > per_order_cap_contracts:
         logger.info(
-            "SYNC: %s | nibbling: gap %d → %d contracts ($%.0f cap @ %.4f)",
-            mkt_tag, contracts, per_order_cap_contracts, MAX_ORDER_USDC, order_price,
+            "SYNC: %s | nibbling: gap %d → %d contracts ($%.0f cap @ %.4f)%s",
+            mkt_tag, contracts, per_order_cap_contracts, nibble_cap_usdc, order_price,
+            " [FAST]" if fast_mode else "",
         )
         contracts = per_order_cap_contracts
     decision_context["final_contracts"] = contracts
@@ -928,7 +999,7 @@ async def _evaluate_position(
             logger.info("SYNC: %s | order notional under CLOB $1 min → SKIP", mkt_tag)
         return await finish("under_min", "under_min_notional", requested_contracts=contracts, filled_contracts=filled_contracts)
 
-    taker_amount_usdc = round(min(contracts * order_price, MAX_ORDER_USDC, allowed_additional_usdc), 2)
+    taker_amount_usdc = round(min(contracts * order_price, nibble_cap_usdc, allowed_additional_usdc), 2)
     decision_context["taker_amount_usdc"] = taker_amount_usdc
     if taker_amount_usdc < MIN_NOTIONAL_USDC:
         if _note_decision(addr, pos.condition_id, outcome, "SKIP:under_min_notional"):
@@ -974,8 +1045,23 @@ async def _evaluate_position(
             logger.warning("SYNC: %s | gap %d contracts | FAK placement failed", mkt_tag, contracts)
         return await finish("place_failed", requested_contracts=contracts, filled_contracts=0)
 
+    # Polymarket-side DELAYED means the FAK was queued and will match async.
+    # Keep the row PENDING so _refresh_inflight transitions it to FILLED on the
+    # next cycle instead of abandoning the on-chain position as CANCELLED/0.
+    is_delayed_async = (
+        mode == "LIVE"
+        and immediate_fill_contracts <= 0
+        and (taker_result.status or "").upper() == "DELAYED"
+        and taker_result.accepted
+    )
+
     fill_status = "FILLED"
-    if immediate_fill_contracts <= 0:
+    if is_delayed_async:
+        fill_status = "PENDING"
+        actual_contracts = contracts
+        size_usdc = round(contracts * order_price, 2)
+        avg_fill_price = order_price
+    elif immediate_fill_contracts <= 0:
         fill_status = "CANCELLED"
         actual_contracts = 0
         size_usdc = 0.0
@@ -1024,10 +1110,21 @@ async def _evaluate_position(
     await session.flush()
     _LAST_DECISION.pop((addr, pos.condition_id, outcome), None)
     logger.info(
-        "SYNC: %s | whale_avg %.3f, mid %.3f | filled %d reserved %d effective %d / target %d max %d | gap %d → FAK BUY $%.2f max %.4f filled %d/%d [%s]",
+        "SYNC: %s | whale_avg %.3f, mid %.3f | filled %d reserved %d effective %d / target %d max %d | gap %d → FAK BUY $%.2f max %.4f filled %d/%d [%s%s]",
         mkt_tag, whale_avg, mid, filled_contracts, reserved_contracts, effective_contracts, target_contracts, max_target_contracts, gap_contracts,
-        taker_amount_usdc, max_price, immediate_fill_contracts, contracts, mode,
+        taker_amount_usdc, max_price, immediate_fill_contracts, contracts, mode, " FAST" if fast_mode else "",
     )
+    if is_delayed_async:
+        return await finish(
+            "FAK_DELAYED",
+            "fak_queued_delayed",
+            requested_contracts=contracts,
+            filled_contracts=0,
+            order_ids=[order_id],
+            my_trade_id=trade.id,
+            order_notional_usdc=taker_amount_usdc,
+            execution_mode=mode,
+        )
     if immediate_fill_contracts <= 0:
         return await finish(
             "FAK_NO_FILL",
@@ -1108,14 +1205,27 @@ async def sync_whale_positions_once() -> int:
                 logger.warning("SYNC: get_positions failed for %s: %s", addr[:10], e)
                 continue
 
-            logger.info("SYNC: %s polling — %d open positions", addr[:10], len(positions))
+            # Drop positions whose market has resolved (PM still lists them
+            # with redeemable=True until the holder sweeps on-chain). They
+            # would only generate stale_past_resolution decisions otherwise.
+            live_positions = [p for p in positions if not p.redeemable]
+            redeemable_skipped = len(positions) - len(live_positions)
+            if redeemable_skipped:
+                logger.info(
+                    "SYNC: %s polling — %d open positions (skipped %d redeemable)",
+                    addr[:10], len(live_positions), redeemable_skipped,
+                )
+            else:
+                logger.info(
+                    "SYNC: %s polling — %d open positions", addr[:10], len(live_positions),
+                )
             open_position_keys = {
                 (p.condition_id, (p.outcome or "").upper())
-                for p in positions
+                for p in live_positions
                 if p.condition_id and (p.outcome or "").upper() in {"YES", "NO"}
             }
             counts: dict[str, int] = {}
-            for pos in positions:
+            for pos in live_positions:
                 async with async_session() as session:
                     try:
                         code = await _evaluate_position(

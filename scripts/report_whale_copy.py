@@ -21,7 +21,54 @@ from sqlalchemy import text
 from src.config import settings
 from src.db import async_session
 from src.polymarket.clob_client import CLOBClient
+from src.polymarket.data_api import DataAPIClient
 from src.signals.weather_resolution import parse_dt, weather_local_resolution_cutoff
+
+
+_PNL_INTERVAL_BY_DAYS = {1: "1d", 7: "1w", 30: "1m"}
+
+
+async def _fetch_bot_realized(start_utc: datetime) -> float:
+    """Sum bot's realized PnL from my_trades over the window. Authoritative cash PnL
+    on positions that closed during the window (resolved + exit_timestamp >= start)."""
+    async with async_session() as session:
+        result = await session.execute(
+            text(
+                "SELECT COALESCE(SUM(pnl_usdc), 0)::float AS realized "
+                "FROM my_trades "
+                "WHERE resolved = TRUE AND exit_timestamp >= :start"
+            ),
+            {"start": start_utc},
+        )
+        row = result.first()
+        return float(row.realized) if row else 0.0
+
+
+async def _fetch_pnl_deltas(addrs: list[str], days: int) -> dict[str, float]:
+    """Fetch windowed PnL delta from user-pnl-api for each address.
+
+    The user-pnl-api is the same source the Polymarket UI uses and is the
+    authoritative truth for windowed PnL — it includes realized + unrealized,
+    unlike the per-position MTM which only marks open positions. See
+    project memory `reference_pm_pnl_api.md`.
+    """
+    interval = _PNL_INTERVAL_BY_DAYS.get(days, "all")
+    fidelity = "1h" if days <= 1 else ("12h" if days <= 7 else "1d")
+    out: dict[str, float] = {}
+    client = DataAPIClient()
+    try:
+        for addr in addrs:
+            try:
+                series = await client.get_user_pnl_series(addr, interval=interval, fidelity=fidelity)
+            except Exception:
+                series = []
+            if series and len(series) >= 2:
+                out[addr.lower()] = float(series[-1]["p"]) - float(series[0]["p"])
+            else:
+                out[addr.lower()] = 0.0
+    finally:
+        await client.close()
+    return out
 
 
 class FreshPriceError(RuntimeError):
@@ -487,24 +534,27 @@ def _render_markdown(
     *,
     price_fetched_at: datetime | None = None,
     price_source: str = "clob_midpoints",
+    pnl_deltas: dict[str, float] | None = None,
+    bot_pnl_delta: float | None = None,
+    bot_realized: float | None = None,
+    days: int = 1,
 ) -> str:
     names = {wallet.lower(): wallet[:10] for wallet in settings.watch_whales}
     lines = [
         "# Whale Copy Report",
         f"Timezone: {tz_name}",
-        "MTM uses fresh CLOB batch midpoints for unresolved markets; resolved markets use 1/0.",
+        f"Window: last {days}d",
+        "",
+        "**Headline PnL summary** = REALIZED + UNREALIZED (windowed delta from user-pnl-api;",
+        "                          matches Polymarket UI; includes redemptions, sells, open MTM).",
+        "**Per-position MTM**     = UNREALIZED only (current_mid × open_contracts − cost_basis;",
+        "                          excludes realized gains from closed/sold/redeemed positions —",
+        "                          those are already counted in the headline).",
         f"price_source={price_source}",
     ]
     if price_fetched_at is not None:
         lines.append(f"price_fetched_at={price_fetched_at.isoformat()}")
         lines.append("price_age_seconds=0")
-    summary = {}
-    for row in rows:
-        key = str(row.local_day)
-        summary.setdefault(key, {"positions": 0, "ordered": 0, "filled": 0, "whale_mtm": 0.0, "our_mtm": 0.0})
-        summary[key]["positions"] += 1
-        summary[key]["ordered"] += int((row.order_attempts or 0) > 0)
-        summary[key]["filled"] += int((row.filled_contracts or 0) > 0)
 
     enriched = []
     for row in rows:
@@ -517,19 +567,48 @@ def _render_markdown(
         filled_cost = float(row.filled_cost or 0)
         whale_mtm = None if mid is None else whale_contracts * mid - whale_cost
         our_mtm = 0.0 if filled_contracts <= 0 else (None if mid is None else filled_contracts * mid - filled_cost)
-        if whale_mtm is not None:
-            summary[str(row.local_day)]["whale_mtm"] += whale_mtm
-        if our_mtm is not None:
-            summary[str(row.local_day)]["our_mtm"] += our_mtm
         enriched.append((row, mid, whale_mtm, our_mtm))
 
-    lines.append("\n## Summary")
-    lines.append("| Day | Positions | Ordered | Filled | Whale MTM | Our MTM |")
-    lines.append("|---|---:|---:|---:|---:|---:|")
+    summary = {}
+    for row in rows:
+        key = str(row.local_day)
+        summary.setdefault(key, {"positions": 0, "ordered": 0, "filled": 0})
+        summary[key]["positions"] += 1
+        summary[key]["ordered"] += int((row.order_attempts or 0) > 0)
+        summary[key]["filled"] += int((row.filled_contracts or 0) > 0)
+
+    pnl_deltas = pnl_deltas or {}
+    whales_total = sum(pnl_deltas.get(w.lower(), 0.0) for w in settings.watch_whales)
+    bot_delta = bot_pnl_delta or 0.0
+    bot_realized_v = bot_realized or 0.0
+    bot_open_mtm = sum((our_mtm or 0.0) for _, _, _, our_mtm in enriched if our_mtm is not None)
+    bot_split_total = bot_realized_v + bot_open_mtm
+    capture_pct = (bot_delta / whales_total * 100) if whales_total else 0.0
+
+    lines.append(f"\n## Headline PnL (last {days}d) — REALIZED + UNREALIZED")
+    lines.append("| Wallet | PnL |")
+    lines.append("|---|---:|")
+    for wallet in settings.watch_whales:
+        lines.append(f"| {wallet[:10]} | {_money(pnl_deltas.get(wallet.lower(), 0.0))} |")
+    lines.append(f"| **Whales total** | **{_money(whales_total)}** |")
+    lines.append(f"| Bot (user-pnl-api) | {_money(bot_delta)} |")
+    lines.append(f"| **Capture %** | **{capture_pct:.0f}%** |")
+
+    lines.append(f"\n## Bot PnL split (last {days}d, source=my_trades + open MTM)")
+    lines.append("| Component | $ |")
+    lines.append("|---|---:|")
+    lines.append(f"| Realized (closed positions in window) | {_money(bot_realized_v)} |")
+    lines.append(f"| Open MTM (in-window positions still open) | {_money(bot_open_mtm)} |")
+    lines.append(f"| **Total (split)** | **{_money(bot_split_total)}** |")
+    lines.append(f"| Cross-check vs user-pnl-api | {_money(bot_delta)} (Δ {_money(bot_split_total - bot_delta)}) |")
+    lines.append("> Δ explained by: fees, in-flight orders, and unrealized changes on positions opened *before* the window.")
+
+    lines.append("\n## Copy quality (per-day)")
+    lines.append("| Day | Positions | Ordered | Filled |")
+    lines.append("|---|---:|---:|---:|")
     for day, data in sorted(summary.items()):
         lines.append(
-            f"| {day} | {data['positions']} | {data['ordered']} | {data['filled']} | "
-            f"{_money(data['whale_mtm'])} | {_money(data['our_mtm'])} |"
+            f"| {day} | {data['positions']} | {data['ordered']} | {data['filled']} |"
         )
 
     for day in sorted({str(row.local_day) for row in rows}):
@@ -545,11 +624,14 @@ def _render_markdown(
                 source = row.latest_decision_source or "no_decision"
                 if row.latest_latency_seconds is not None:
                     source = f"{source}/{float(row.latest_latency_seconds):.1f}s"
+                market_name = _short_market(row.question, row.condition_id)
+                if getattr(row, "resolved", False) and getattr(row, "resolved_outcome", None):
+                    market_name = f"{market_name} [RES {row.resolved_outcome}]"
                 lines.append(
                     "| "
                     + " | ".join(
                         [
-                            _short_market(row.question, row.condition_id),
+                            market_name,
                             row.outcome,
                             f"{_num(row.whale_contracts)} / {_money(row.whale_cost)}",
                             "n/a" if mid is None else f"{mid:.3f}",
@@ -562,6 +644,121 @@ def _render_markdown(
                         ]
                     )
                     + " |"
+                )
+    return "\n".join(lines)
+
+
+def _render_text(
+    rows,
+    mids,
+    tz_name: str,
+    *,
+    price_fetched_at: datetime | None = None,
+    price_source: str = "clob_midpoints",
+    pnl_deltas: dict[str, float] | None = None,
+    bot_pnl_delta: float | None = None,
+    bot_realized: float | None = None,
+    days: int = 1,
+) -> str:
+    """Plain-text rendering of the whale copy report (mirrors _render_markdown)."""
+    pnl_deltas = pnl_deltas or {}
+    whales_total = sum(pnl_deltas.get(w.lower(), 0.0) for w in settings.watch_whales)
+    bot_delta = bot_pnl_delta or 0.0
+    bot_realized_v = bot_realized or 0.0
+    # Sum bot's open MTM across in-window rows.
+    bot_open_mtm = 0.0
+    for row in rows:
+        mid = mids.get(row.token_id)
+        if getattr(row, "resolved", False) and getattr(row, "resolved_outcome", None):
+            mid = 1.0 if row.resolved_outcome == row.outcome else 0.0
+        filled_contracts = float(row.filled_contracts or 0)
+        filled_cost = float(row.filled_cost or 0)
+        if mid is None or filled_contracts <= 0:
+            continue
+        bot_open_mtm += filled_contracts * mid - filled_cost
+    bot_split_total = bot_realized_v + bot_open_mtm
+    capture_pct = (bot_delta / whales_total * 100) if whales_total else 0.0
+
+    lines = [
+        "Whale Copy Report",
+        f"Timezone: {tz_name}",
+        f"Window: last {days}d",
+        "",
+        "Headline PnL summary = REALIZED + UNREALIZED (user-pnl-api windowed delta;",
+        "                      matches Polymarket UI; includes redemptions/sells/open MTM).",
+        "Per-position MTM     = UNREALIZED only (current_mid × open_contracts − cost_basis;",
+        "                      excludes realized gains from closed positions, which are",
+        "                      already counted in the headline above).",
+        f"price_source={price_source}",
+    ]
+    if price_fetched_at is not None:
+        lines.append(f"price_fetched_at={price_fetched_at.isoformat()}")
+
+    lines.append(f"\nHeadline PnL (last {days}d) — REALIZED + UNREALIZED")
+    lines.append("-" * 40)
+    for wallet in settings.watch_whales:
+        lines.append(f"  {wallet[:10]:<22s} {_money(pnl_deltas.get(wallet.lower(), 0.0)):>12s}")
+    lines.append("-" * 40)
+    lines.append(f"  {'Whales total':<22s} {_money(whales_total):>12s}")
+    lines.append(f"  {'Bot (user-pnl-api)':<22s} {_money(bot_delta):>12s}")
+    lines.append(f"  {'Capture %':<22s} {capture_pct:>11.0f}%")
+
+    lines.append(f"\nBot PnL split (last {days}d, source=my_trades + open MTM)")
+    lines.append("-" * 40)
+    lines.append(f"  {'Realized (closed)':<22s} {_money(bot_realized_v):>12s}")
+    lines.append(f"  {'Open MTM (in-window)':<22s} {_money(bot_open_mtm):>12s}")
+    lines.append("-" * 40)
+    lines.append(f"  {'Total (split)':<22s} {_money(bot_split_total):>12s}")
+    lines.append(f"  {'vs user-pnl-api':<22s} {_money(bot_delta):>12s}  (Δ {_money(bot_split_total - bot_delta)})")
+    lines.append("  Δ = fees + in-flight orders + MTM changes on positions opened before window")
+
+    summary = {}
+    for row in rows:
+        key = str(row.local_day)
+        summary.setdefault(key, {"positions": 0, "ordered": 0, "filled": 0})
+        summary[key]["positions"] += 1
+        summary[key]["ordered"] += int((row.order_attempts or 0) > 0)
+        summary[key]["filled"] += int((row.filled_contracts or 0) > 0)
+
+    lines.append("\nCopy quality (per-day)")
+    lines.append(f"  {'Day':<12s} {'Positions':>10s} {'Ordered':>10s} {'Filled':>10s}")
+    for day, data in sorted(summary.items()):
+        lines.append(f"  {day:<12s} {data['positions']:>10d} {data['ordered']:>10d} {data['filled']:>10d}")
+
+    enriched = []
+    for row in rows:
+        mid = mids.get(row.token_id)
+        if getattr(row, "resolved", False) and getattr(row, "resolved_outcome", None):
+            mid = 1.0 if row.resolved_outcome == row.outcome else 0.0
+        whale_contracts = float(row.whale_contracts or 0)
+        whale_cost = float(row.whale_cost or 0)
+        filled_contracts = float(row.filled_contracts or 0)
+        filled_cost = float(row.filled_cost or 0)
+        whale_mtm = None if mid is None else whale_contracts * mid - whale_cost
+        our_mtm = 0.0 if filled_contracts <= 0 else (None if mid is None else filled_contracts * mid - filled_cost)
+        enriched.append((row, mid, whale_mtm, our_mtm))
+
+    names = {wallet.lower(): wallet[:10] for wallet in settings.watch_whales}
+    for day in sorted({str(row.local_day) for row in rows}):
+        lines.append(f"\nDay {day}")
+        for wallet, name in names.items():
+            wallet_rows = [item for item in enriched if str(item[0].local_day) == day and item[0].wallet_address == wallet]
+            if not wallet_rows:
+                continue
+            lines.append(f"\n  Whale {name}")
+            lines.append(f"    {'Market':<42s} {'Side':<5s} {'Whale':>14s} {'Mid':>6s} {'WMTM':>9s} {'Our':>14s} {'OurMTM':>9s}  Decision")
+            for row, mid, whale_mtm, our_mtm in wallet_rows:
+                market_name = _short_market(row.question, row.condition_id)
+                if getattr(row, "resolved", False) and getattr(row, "resolved_outcome", None):
+                    market_name = f"{market_name} [RES {row.resolved_outcome}]"
+                lines.append(
+                    f"    {market_name[:42]:<42s} "
+                    f"{row.outcome:<5s} "
+                    f"{(_num(row.whale_contracts) + '/' + _money(row.whale_cost)):>14s} "
+                    f"{('n/a' if mid is None else f'{mid:.3f}'):>6s} "
+                    f"{_money(whale_mtm):>9s} "
+                    f"{(_num(row.filled_contracts) + '/' + _money(row.filled_cost)):>14s} "
+                    f"{_money(our_mtm):>9s}  {_fallback_reason(row)}"
                 )
     return "\n".join(lines)
 
@@ -849,13 +1046,24 @@ async def main() -> None:
             allow_missing=args.allow_missing_live_prices,
         )
         price_source = "clob_midpoints"
-    rendered = _render_markdown(
-            rows,
-            mids,
-            args.timezone,
-            price_fetched_at=price_fetched_at,
-            price_source=price_source,
-        )
+
+    addrs = list(settings.watch_whales) + [settings.polymarket_wallet_address]
+    deltas = await _fetch_pnl_deltas([a for a in addrs if a], args.days)
+    bot_delta = deltas.get((settings.polymarket_wallet_address or "").lower(), 0.0)
+    bot_realized = await _fetch_bot_realized(start_utc)
+
+    render_fn = _render_markdown if args.format == "markdown" else _render_text
+    rendered = render_fn(
+        rows,
+        mids,
+        args.timezone,
+        price_fetched_at=price_fetched_at,
+        price_source=price_source,
+        pnl_deltas=deltas,
+        bot_pnl_delta=bot_delta,
+        bot_realized=bot_realized,
+        days=args.days,
+    )
     _emit_report(rendered, args.output_file)
 
 

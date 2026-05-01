@@ -25,6 +25,12 @@ ZERO_BYTES32 = b"\x00" * 32
 ECONOMIC_FILL_STATUSES = ("FILLED", "PARTIAL", "PAPER")
 UNFILLED_FILL_STATUSES = ("PENDING", "FAILED", "CANCELLED")
 
+# Serializes on-chain redemption txs across the process. Public Polygon RPCs
+# return divergent `eth_getTransactionCount("pending")` values between calls,
+# so concurrent `_redeem_positions` invocations can mint identical nonces and
+# collide ("nonce too low: next nonce N, tx nonce N-1"). One lock fixes it.
+_REDEMPTION_LOCK = asyncio.Lock()
+
 
 async def check_resolutions() -> int:
     """Check for newly resolved markets, update P&L, and redeem tokens. Returns count."""
@@ -114,6 +120,18 @@ async def redeem_all_resolved() -> int:
 
     if cleared > 0:
         logger.info("Redemption sweep: %d positions redeemed on-chain", cleared)
+        # Legacy markets redeem to USDC.e; CLOB v2 settles in pUSD. Wrap so
+        # the proceeds are usable as trading collateral on the next sweep.
+        try:
+            from eth_account import Account
+            from src.polymarket.onramp import wrap_idle_usdce_to_pusd
+
+            private_key = settings.polymarket_private_key
+            if private_key:
+                account = Account.from_key(private_key)
+                await asyncio.to_thread(wrap_idle_usdce_to_pusd, account)
+        except Exception as e:
+            logger.warning("Post-redemption USDC.e wrap failed: %s", e)
     return cleared
 
 
@@ -194,8 +212,22 @@ async def _check_market_resolution(
     )
     filled_trades = result.scalars().all()
 
+    # Fetch PM realized_pnl per (cid, outcome) so resolution writes PM truth
+    # rather than our recomputed (1-entry)×contracts. Falls back to derived
+    # math if PM has already swept the position.
+    pm_realized_by_outcome = await _fetch_pm_realized_pnl(market.condition_id)
+
     for trade in filled_trades:
-        pnl = apply_resolution_to_trade(trade, winning_outcome)
+        outcome_pm_pnl = pm_realized_by_outcome.get((trade.outcome or "").upper())
+        # Distribute the per-outcome PM realized_pnl across this trade by its
+        # share of the total economic contracts on this side.
+        share_pnl = None
+        if outcome_pm_pnl is not None:
+            same_side = [t for t in filled_trades if (t.outcome or "").upper() == (trade.outcome or "").upper()]
+            total_contracts = sum(int(t.num_contracts or 0) for t in same_side) or 1
+            share = (int(trade.num_contracts or 0) / total_contracts) if total_contracts else 0
+            share_pnl = round(outcome_pm_pnl * share, 2)
+        pnl = apply_resolution_to_trade(trade, winning_outcome, pm_pnl=share_pnl)
 
         logger.info(
             "Trade %d resolved: %s P&L=$%.2f (fill_status=%s)",
@@ -254,18 +286,29 @@ async def _check_market_resolution(
     return True
 
 
-def apply_resolution_to_trade(trade: MyTrade, winning_outcome: str) -> float:
-    """Apply terminal resolution PnL to one economic trade row."""
+def apply_resolution_to_trade(
+    trade: MyTrade,
+    winning_outcome: str,
+    *,
+    pm_pnl: float | None = None,
+) -> float:
+    """Apply terminal resolution PnL to one economic trade row.
+
+    When ``pm_pnl`` is provided we honor PM's realized_pnl directly
+    (per ``feedback_simple_pnl.md``). Falls back to deterministic
+    (1-entry)×contracts only when PM has no record (e.g., already swept).
+    """
     entry_price = float(trade.entry_price or 0)
     contracts = trade.num_contracts or 0
     won = trade.outcome.upper() == winning_outcome.upper()
 
-    if won:
+    if pm_pnl is not None:
+        pnl = pm_pnl
+    elif won:
         pnl = (1.0 - entry_price) * contracts
-        trade.trade_outcome = "WIN"
     else:
         pnl = -entry_price * contracts
-        trade.trade_outcome = "LOSS"
+    trade.trade_outcome = "WIN" if won else "LOSS"
 
     trade.pnl_usdc = Decimal(str(round(pnl, 2)))
     trade.exit_price = Decimal("1.0") if won else Decimal("0.0")
@@ -274,91 +317,129 @@ def apply_resolution_to_trade(trade: MyTrade, winning_outcome: str) -> float:
     return pnl
 
 
+async def _fetch_pm_realized_pnl(condition_id: str) -> dict[str, float]:
+    """Return {outcome: realized_pnl} from PM for one condition, or {} on failure."""
+    from src.polymarket.data_api import DataAPIClient
+
+    wallet = settings.polymarket_wallet_address
+    if not wallet:
+        return {}
+    client = DataAPIClient()
+    try:
+        active = await client.get_positions(wallet)
+        closed = await client.get_closed_positions(wallet)
+    except Exception as e:
+        logger.warning("PM realized_pnl fetch failed for %s: %s", condition_id[:10], e)
+        return {}
+    finally:
+        await client.close()
+
+    out: dict[str, float] = {}
+    for p in (active or []) + (closed or []):
+        if p.condition_id != condition_id:
+            continue
+        outcome = (p.outcome or "").upper()
+        if outcome in {"YES", "NO"}:
+            out[outcome] = float(p.realized_pnl or 0)
+    return out
+
+
 async def _redeem_positions(condition_id: str, neg_risk: bool = False) -> None:
     """Redeem conditional tokens on-chain.
 
     For standard markets: calls ConditionalTokens.redeemPositions()
     For negRisk markets: calls NegRiskAdapter.redeemPositions(bytes32, uint256[])
+
+    Serialized via _REDEMPTION_LOCK to prevent concurrent invocations from
+    racing on the same nonce against public RPC mempool views.
     """
-    try:
-        from eth_abi import encode as abi_encode
-        from eth_account import Account
-        from src.polymarket.polygon_tx import (
-            get_erc1155_balance, send_transaction, wait_for_receipt,
-        )
-
-        private_key = settings.polymarket_private_key
-        if not private_key:
-            logger.warning("No private key — cannot redeem positions")
-            return
-
-        account = Account.from_key(private_key)
-        address = account.address
-
-        # Get token IDs for this market from DB
-        async with async_session() as session:
-            result = await session.execute(
-                select(MarketToken).where(MarketToken.condition_id == condition_id)
+    async with _REDEMPTION_LOCK:
+        try:
+            from eth_abi import encode as abi_encode
+            from eth_account import Account
+            from src.polymarket.polygon_tx import (
+                get_erc1155_balance, send_transaction, wait_for_receipt,
             )
-            tokens = result.scalars().all()
 
-        if not tokens:
-            logger.debug("No tokens found for %s — skipping redemption", condition_id[:10])
-            return
+            private_key = settings.polymarket_private_key
+            if not private_key:
+                logger.warning("No private key — cannot redeem positions")
+                return
 
-        # Check on-chain balances
-        balances = []
-        has_tokens = False
-        for token in tokens:
-            balance = await asyncio.to_thread(
-                get_erc1155_balance, CONDITIONAL_TOKENS, address, int(token.token_id)
-            )
-            balances.append(balance)
-            if balance > 0:
-                has_tokens = True
-                logger.info(
-                    "Found %d on-chain tokens for %s %s",
-                    balance, condition_id[:10], token.outcome,
+            account = Account.from_key(private_key)
+            address = account.address
+
+            # Get token IDs for this market from DB
+            async with async_session() as session:
+                result = await session.execute(
+                    select(MarketToken).where(MarketToken.condition_id == condition_id)
                 )
+                tokens = result.scalars().all()
 
-        if not has_tokens:
-            logger.debug("No on-chain tokens for %s — skipping redemption", condition_id[:10])
-            return
+            if not tokens:
+                logger.debug("No tokens found for %s — skipping redemption", condition_id[:10])
+                return
 
-        cond_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+            # Check on-chain balances
+            balances = []
+            has_tokens = False
+            for token in tokens:
+                balance = await asyncio.to_thread(
+                    get_erc1155_balance, CONDITIONAL_TOKENS, address, int(token.token_id)
+                )
+                balances.append(balance)
+                if balance > 0:
+                    has_tokens = True
+                    logger.info(
+                        "Found %d on-chain tokens for %s %s",
+                        balance, condition_id[:10], token.outcome,
+                    )
 
-        if neg_risk:
-            # NegRisk: call NegRiskAdapter.redeemPositions(bytes32, uint256[])
-            calldata = NEG_RISK_REDEEM_SELECTOR + abi_encode(
-                ["bytes32", "uint256[]"],
-                [cond_bytes, balances],
+            if not has_tokens:
+                logger.debug("No on-chain tokens for %s — skipping redemption", condition_id[:10])
+                return
+
+            cond_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+
+            if neg_risk:
+                # NegRisk: call NegRiskAdapter.redeemPositions(bytes32, uint256[])
+                calldata = NEG_RISK_REDEEM_SELECTOR + abi_encode(
+                    ["bytes32", "uint256[]"],
+                    [cond_bytes, balances],
+                )
+                target_contract = NEG_RISK_ADAPTER
+            else:
+                # Standard: call ConditionalTokens.redeemPositions(address, bytes32, bytes32, uint256[])
+                calldata = REDEEM_SELECTOR + abi_encode(
+                    ["address", "bytes32", "bytes32", "uint256[]"],
+                    [USDC_ADDRESS, ZERO_BYTES32, cond_bytes, [1, 2]],
+                )
+                target_contract = CONDITIONAL_TOKENS
+
+            logger.info("Redeeming positions for market %s (negRisk=%s)...", condition_id[:10], neg_risk)
+            tx_hash = await asyncio.to_thread(
+                send_transaction, account, target_contract, calldata,
             )
-            target_contract = NEG_RISK_ADAPTER
-        else:
-            # Standard: call ConditionalTokens.redeemPositions(address, bytes32, bytes32, uint256[])
-            calldata = REDEEM_SELECTOR + abi_encode(
-                ["address", "bytes32", "bytes32", "uint256[]"],
-                [USDC_ADDRESS, ZERO_BYTES32, cond_bytes, [1, 2]],
-            )
-            target_contract = CONDITIONAL_TOKENS
+            logger.info("Redeem tx sent: %s", tx_hash[:20])
 
-        logger.info("Redeeming positions for market %s (negRisk=%s)...", condition_id[:10], neg_risk)
-        tx_hash = await asyncio.to_thread(
-            send_transaction, account, target_contract, calldata,
-        )
-        logger.info("Redeem tx sent: %s", tx_hash[:20])
+            receipt = await asyncio.to_thread(wait_for_receipt, tx_hash)
+            if receipt and int(receipt.get("status", "0x0"), 16) == 1:
+                logger.info("Redeemed positions for %s successfully", condition_id[:10])
+                try:
+                    from src.polymarket.clob_auth import get_auth_client
+                    auth = get_auth_client()
+                    await auth.get_balance(refresh=True)
+                except Exception as e:
+                    logger.debug("Balance refresh after redemption failed: %s", e)
+            else:
+                logger.warning("Redeem tx failed or timed out for %s", condition_id[:10])
 
-        receipt = await asyncio.to_thread(wait_for_receipt, tx_hash)
-        if receipt and int(receipt.get("status", "0x0"), 16) == 1:
-            logger.info("Redeemed positions for %s successfully", condition_id[:10])
-            try:
-                from src.polymarket.clob_auth import get_auth_client
-                auth = get_auth_client()
-                await auth.get_balance(refresh=True)
-            except Exception as e:
-                logger.debug("Balance refresh after redemption failed: %s", e)
-        else:
-            logger.warning("Redeem tx failed or timed out for %s", condition_id[:10])
-
-    except Exception as e:
-        logger.error("Redemption failed for %s: %s", condition_id[:10], e)
+        except Exception as e:
+            msg = str(e)
+            if "result for condition not received yet" in msg:
+                logger.warning(
+                    "Redemption deferred for %s: oracle hasn't posted result yet (will retry next cycle)",
+                    condition_id[:10],
+                )
+            else:
+                logger.error("Redemption failed for %s: %s", condition_id[:10], e)
