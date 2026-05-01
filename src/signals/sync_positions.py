@@ -65,7 +65,7 @@ MIN_NOTIONAL_USDC = 1.05  # CLOB rejects BUY orders under $1; pad a cent for rou
 MIN_ORDER_CONTRACTS = 5    # CLOB rejects orders smaller than 5 contracts.
 FLOOR_FRAC = 0.80          # Skip if midpoint < whale_avg * FLOOR_FRAC (20% floor — thesis broken).
 CEILING_FRAC = 1.05        # Allow bidding up to whale_avg * CEILING_FRAC (5% above — capture winners).
-MAX_POSITION_FRAC_OF_WALLET = 0.10  # No single position > 10% of wallet USDC.
+MAX_POSITION_FRAC_OF_WALLET = 0.20  # No single position > 20% of wallet USDC.
 MAX_ORDER_USDC = 100.0     # Nibble cap — no single order larger than $100 notional.
 FAST_MAX_PRICE = 0.90      # Fast-execution absolute price ceiling (settings.fast_execution_whales).
 FAST_MAX_ORDER_USDC = 100.0  # Fast-execution per-order nibble ($100 vs default $50).
@@ -945,7 +945,7 @@ async def _evaluate_position(
     # this position beyond MAX_POSITION_FRAC_OF_WALLET of wallet USDC.
     contracts = min(gap_contracts, buffered_gap_contracts)
     # Fast-track whale gets a flat $100 nibble per websocket event regardless of
-    # how small his actual buy was. The 10% per-position cap and the per-order
+    # how small his actual buy was. The 20% per-position cap and the per-order
     # nibble cap below are still backstops.
     if fast_mode:
         contracts = max(contracts, int(nibble_cap_usdc / order_price))
