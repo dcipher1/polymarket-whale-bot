@@ -65,10 +65,10 @@ MIN_NOTIONAL_USDC = 1.05  # CLOB rejects BUY orders under $1; pad a cent for rou
 MIN_ORDER_CONTRACTS = 5    # CLOB rejects orders smaller than 5 contracts.
 FLOOR_FRAC = 0.80          # Skip if midpoint < whale_avg * FLOOR_FRAC (20% floor — thesis broken).
 CEILING_FRAC = 1.05        # Allow bidding up to whale_avg * CEILING_FRAC (5% above — capture winners).
-MAX_POSITION_FRAC_OF_WALLET = 0.20  # No single position > 20% of wallet USDC.
-MAX_ORDER_USDC = 100.0     # Nibble cap — no single order larger than $100 notional.
+MAX_ORDER_USDC = 200.0     # Nibble cap — no single order larger than $200 notional.
 FAST_MAX_PRICE = 0.90      # Fast-execution absolute price ceiling (settings.fast_execution_whales).
-FAST_MAX_ORDER_USDC = 100.0  # Fast-execution per-order nibble ($100 vs default $50).
+FAST_MAX_ORDER_USDC = 200.0  # Fast-execution per-order nibble (matches default).
+MIN_WALLET_USDC = 50.0     # Halt new BUYs when pUSD balance falls to this floor.
 LOW_PRICE_OBSERVATION = 0.10  # Log low average entries, but do not hard-skip real aggregate positions.
 COPY_TARGET_BUFFER_FRAC = 1.05  # Allow only 5% above the watched whale's visible size.
 TERMINAL_FILL = {"FILLED", "PARTIAL"}
@@ -79,6 +79,21 @@ _CITY_ABBR = {
     "San Francisco": "SF", "Los Angeles": "LA",
     "Washington D.C.": "DC", "Washington DC": "DC",
 }
+
+_CITY_FROM_SLUG_RE = re.compile(r"^(?:highest|lowest)-temperature-in-(.+?)-on-")
+
+
+def _city_from_slug(slug: str) -> str | None:
+    """Extract canonical city name from a Polymarket weather market slug.
+    Mirrors /home/pi/whale_finder/filters.py:_city_from_slug — keep in sync if
+    Polymarket's slug shape evolves."""
+    m = _CITY_FROM_SLUG_RE.match(slug or "")
+    if not m:
+        return None
+    raw = m.group(1).replace("-", " ")
+    return raw.upper() if len(raw) <= 3 else raw.title()
+
+
 def _parse_dt(value) -> datetime | None:
     return parse_dt(value)
 
@@ -688,6 +703,16 @@ async def _evaluate_position(
     # Compute the readable tag early so cancel logs can use it too.
     mkt_tag = _mkt_tag(market.question or pos.title, outcome, pos.end_date)
 
+    # Per-whale city allowlist gate. Whales not listed in watch_whale_cities
+    # bypass this filter (default: any weather city).
+    allowed_cities = settings.watch_whale_cities.get(addr.lower())
+    if allowed_cities is not None:
+        city = _city_from_slug(market.slug or pos.slug or "")
+        if not city or city not in allowed_cities:
+            logger.info("SYNC: %s | SKIP city_not_allowed:%s (allowed: %s)",
+                        mkt_tag, city or "unknown", ", ".join(allowed_cities))
+            return await finish("city_not_allowed", f"city_not_allowed:{city or 'unknown'}")
+
     can_buy_by_time, time_code, resolution_time = _candidate_resolution_gate(market, pos)
     decision_context.update(
         {
@@ -941,39 +966,12 @@ async def _evaluate_position(
             )
         return await finish("NO_VALID_PRICE", "price_above_max", requested_contracts=gap_contracts, filled_contracts=filled_contracts)
 
-    # Per-market concentration cap — size down the order if placing it would push
-    # this position beyond MAX_POSITION_FRAC_OF_WALLET of wallet USDC.
     contracts = min(gap_contracts, buffered_gap_contracts)
-    # Fast-track whale gets a flat $100 nibble per websocket event regardless of
-    # how small his actual buy was. The 20% per-position cap and the per-order
-    # nibble cap below are still backstops.
+    # Fast-track whale gets a flat $200 nibble per websocket event regardless of
+    # how small his actual buy was. Wallet floor (MIN_WALLET_USDC, gated upstream
+    # via allow_new_buys) and the per-order nibble cap below are the only bounds.
     if fast_mode:
         contracts = max(contracts, int(nibble_cap_usdc / order_price))
-    position_cap_usdc = wallet_usdc * MAX_POSITION_FRAC_OF_WALLET
-    current_exposure_usdc = exposure.effective_usdc
-    allowed_additional_usdc = max(0.0, position_cap_usdc - current_exposure_usdc)
-    gap_usdc = contracts * order_price
-    if gap_usdc > allowed_additional_usdc:
-        capped_contracts = int(allowed_additional_usdc / order_price)
-        if capped_contracts * order_price < MIN_NOTIONAL_USDC:
-            if _note_decision(addr, pos.condition_id, outcome, "SKIP:position_cap"):
-                logger.info(
-                    "SYNC: %s | gap %d @ $%.2f = $%.2f | at/over %.0f%% cap $%.2f (current $%.2f) → SKIP position_cap",
-                    mkt_tag, contracts, order_price, gap_usdc,
-                    MAX_POSITION_FRAC_OF_WALLET * 100, position_cap_usdc, current_exposure_usdc,
-                )
-            return await finish("position_cap", filled_contracts=filled_contracts)
-        logger.info(
-            "SYNC: %s | sizing down %d → %d contracts (position cap $%.2f)",
-            mkt_tag, contracts, capped_contracts, position_cap_usdc,
-        )
-        contracts = capped_contracts
-    decision_context.update(
-        {
-            "position_cap_usdc": round(position_cap_usdc, 2),
-            "allowed_additional_usdc": round(allowed_additional_usdc, 2),
-        }
-    )
 
     # Per-order nibble cap: never place > nibble_cap_usdc notional in one order.
     per_order_cap_contracts = int(nibble_cap_usdc / order_price)
@@ -999,7 +997,7 @@ async def _evaluate_position(
             logger.info("SYNC: %s | order notional under CLOB $1 min → SKIP", mkt_tag)
         return await finish("under_min", "under_min_notional", requested_contracts=contracts, filled_contracts=filled_contracts)
 
-    taker_amount_usdc = round(min(contracts * order_price, nibble_cap_usdc, allowed_additional_usdc), 2)
+    taker_amount_usdc = round(min(contracts * order_price, nibble_cap_usdc), 2)
     decision_context["taker_amount_usdc"] = taker_amount_usdc
     if taker_amount_usdc < MIN_NOTIONAL_USDC:
         if _note_decision(addr, pos.condition_id, outcome, "SKIP:under_min_notional"):
@@ -1174,7 +1172,7 @@ async def sync_whale_positions_once() -> int:
     clob = CLOBClient()
     allow_new_buys = await _allow_new_buys()
 
-    # Fetch wallet USDC once per cycle for the per-market concentration cap.
+    # Fetch wallet USDC once per cycle. Used to gate the floor (MIN_WALLET_USDC).
     try:
         from src.polymarket.clob_auth import get_auth_client
         wallet_usdc = await get_auth_client().get_balance()
@@ -1188,6 +1186,13 @@ async def sync_whale_positions_once() -> int:
             wallet_usdc = float(settings.starting_capital)
             logger.warning("SYNC: balance fetch failed (using starting_capital $%.0f as paper fallback): %s",
                            wallet_usdc, e)
+    if settings.live_execution_enabled and wallet_usdc <= MIN_WALLET_USDC:
+        if allow_new_buys:
+            logger.warning(
+                "SYNC: wallet $%.2f at/below floor $%.2f — halting new BUYs",
+                wallet_usdc, MIN_WALLET_USDC,
+            )
+        allow_new_buys = False
 
     try:
         for addr in settings.watch_whales:
@@ -1450,6 +1455,13 @@ async def handle_polynode_wallet_event(event: WhaleTradeEvent) -> str:
                 event.condition_id[:10],
             )
             return "balance_unavailable"
+        ws_allow_new_buys = True
+        if settings.live_execution_enabled and wallet_usdc <= MIN_WALLET_USDC:
+            ws_allow_new_buys = False
+            logger.warning(
+                "POLYNODE: wallet $%.2f at/below floor $%.2f — halting websocket BUY: %s",
+                wallet_usdc, MIN_WALLET_USDC, event.wallet_address[:10],
+            )
         async with async_session() as session:
             code = await _evaluate_position(
                 session,
@@ -1457,7 +1469,7 @@ async def handle_polynode_wallet_event(event: WhaleTradeEvent) -> str:
                 pos,
                 clob,
                 wallet_usdc,
-                allow_new_buys=True,
+                allow_new_buys=ws_allow_new_buys,
                 decision_source="websocket",
                 whale_trade_id=whale_trade_id,
                 event_timestamp=event.timestamp,

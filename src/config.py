@@ -76,28 +76,69 @@ class Settings(BaseSettings):
     # All three are hold-to-resolution weather traders. MyTrade.source_wallets tags each
     # fill with the originating whale so we can break PnL down per-whale.
     watch_whales: list[str] = [
-        "0x8aa29c27241b6909a7c4d6cb4f400267aa215a0b",   # US weather, multi-bucket directional + partial hedges
-        "0x9c68b13a2c9b6d2e80826f26cea746cc22ba7936",   # International weather (Jakarta, Karachi, Singapore, Lagos) — fast_execution
-        "0xaa930fdc4caa3c0f6067404a7bd7899ca45f0bc7",   # 82% weather, slow accumulator, ~133 open low-price YES positions, +$12K all-time
-        "0x672fe5d8a7b946fa9bff1b902a44a56718a213cc",   # BA / Tel Aviv / Madrid weather, BUY-only, +$4.5k/month, median $19
+        "0x8aa29c27241b6909a7c4d6cb4f400267aa215a0b",   # US specialist (existing) — Miami/NYC/Denver/Seattle/SF/Atlanta/Austin
+        "0x672fe5d8a7b946fa9bff1b902a44a56718a213cc",   # Madrid/Istanbul/Lucknow (existing)
+        "0x906f2454a777600aea6c506247566decef82371a",   # $22k LT — London/Seoul/Ankara/Chicago
+        "0xaa930fdc4caa3c0f6067404a7bd7899ca45f0bc7",   # Taipei/Sao Paulo/Shenzhen
+        "0xb94aa26e2844c47232377604c6001e88f8a5d680",   # China specialist (Guangzhou/Wuhan/Shanghai/Chengdu/Beijing — measured PFs)
+        "0xf7a4f1a3716f79e4f588642b5d60e61ddc1cf148",   # Houston (only)
+        "0x044f334595a7fd42c143e11c8ec47f23c8d1d1f1",   # Wellington/BA/Dallas/Paris/Toronto/Singapore/Warsaw
+        "0xc1200dd35a85da9b9ba552582d6103dd3d39a7e3",   # International multi-city (HK/Tel Aviv/Chongqing/LA/Amsterdam/Helsinki/Jakarta/Busan/Lagos/Cape Town)
     ]
 
     # Copy sizing — mirror a fraction of the whale's *share count* PER WHALE.
     # With 3 whales and overlap possible on same markets, 1.0 keeps combined exposure manageable.
-    # Each order is capped at $100 notional (MAX_ORDER_USDC in sync_positions.py).
+    # Each order is capped at $200 notional (MAX_ORDER_USDC in sync_positions.py).
+    # Trading halts when wallet balance falls to MIN_WALLET_USDC ($50) — no per-position cap.
     position_size_fraction: float = 1.0
 
     # Per-whale sizing override. Multiplied into the global position_size_fraction
     # so a value of 2.0 means we copy 2x that whale's share count. Addresses must
     # be lowercase. The per-position 10% bankroll cap still applies as a backstop.
     position_size_multipliers: dict[str, float] = {
-        "0x8aa29c27241b6909a7c4d6cb4f400267aa215a0b": 2.0,  # best copy whale, 2x
+        "0x8aa29c27241b6909a7c4d6cb4f400267aa215a0b": 3.0,  # best-ROI US whale, small avg trade
+        "0x672fe5d8a7b946fa9bff1b902a44a56718a213cc": 2.0,  # EU/MENA, +54% capture today
+        # 0x9c68b13a fast-track whale: scaled via FAST_MAX_ORDER_USDC nibble cap.
+        # 0xaa930fdc Asia: stays 1x — negative ROI, don't amplify.
     }
 
     # Fast-execution whales — websocket-driven BUYs from these wallets bypass
     # the whale_avg×1.05 slippage band and bid up to FAST_MAX_PRICE with a
     # FAST_MAX_ORDER_USDC nibble. Env: FAST_EXECUTION_WHALES (comma-separated).
     fast_execution_whales: Annotated[list[str], NoDecode] = []
+
+    # Per-whale city allowlist. Signals from a whale only fire if the market's
+    # city (extracted from slug via _city_from_slug in sync_positions.py) is
+    # in their list. Whales NOT in this dict have NO allowlist applied — they
+    # default to "copy any weather city". Source: whale_finder/allocate_cities.py
+    # output 2026-05-02 — each city assigned to the one whale with strongest edge.
+    watch_whale_cities: dict[str, list[str]] = {
+        "0x8aa29c27241b6909a7c4d6cb4f400267aa215a0b": [
+            "Miami", "NYC", "Denver", "Seattle", "San Francisco", "Atlanta", "Austin",
+        ],
+        "0x672fe5d8a7b946fa9bff1b902a44a56718a213cc": [
+            "Madrid", "Istanbul", "Lucknow",
+        ],
+        "0x906f2454a777600aea6c506247566decef82371a": [
+            "London", "Seoul", "Ankara", "Chicago",
+        ],
+        "0xaa930fdc4caa3c0f6067404a7bd7899ca45f0bc7": [
+            "Taipei", "Sao Paulo", "Shenzhen",
+        ],
+        "0xb94aa26e2844c47232377604c6001e88f8a5d680": [
+            "Guangzhou", "Wuhan", "Shanghai", "Chengdu", "Beijing",
+        ],
+        "0xf7a4f1a3716f79e4f588642b5d60e61ddc1cf148": [
+            "Houston",
+        ],
+        "0x044f334595a7fd42c143e11c8ec47f23c8d1d1f1": [
+            "Wellington", "Buenos Aires", "Dallas", "Paris", "Toronto", "Singapore", "Warsaw",
+        ],
+        "0xc1200dd35a85da9b9ba552582d6103dd3d39a7e3": [
+            "Hong Kong", "Tel Aviv", "Chongqing", "Los Angeles", "Amsterdam",
+            "Helsinki", "Jakarta", "Busan", "Lagos", "Cape Town",
+        ],
+    }
 
     # Wallet freshness
     wallet_stale_days: int = 7
