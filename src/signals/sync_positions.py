@@ -66,6 +66,7 @@ MIN_ORDER_CONTRACTS = 5    # CLOB rejects orders smaller than 5 contracts.
 FLOOR_FRAC = 0.80          # Skip if midpoint < whale_avg * FLOOR_FRAC (20% floor — thesis broken).
 CEILING_FRAC = 1.05        # Allow bidding up to whale_avg * CEILING_FRAC (5% above — capture winners).
 MAX_ORDER_USDC = 200.0     # Nibble cap — no single order larger than $200 notional.
+MAX_POSITION_USDC = 400.0  # Per-position cap — total exposure on a single condition_id+outcome ≤ $400.
 FAST_MAX_PRICE = 0.90      # Fast-execution absolute price ceiling (settings.fast_execution_whales).
 FAST_MAX_ORDER_USDC = 200.0  # Fast-execution per-order nibble (matches default).
 MIN_WALLET_USDC = 50.0     # Halt new BUYs when pUSD balance falls to this floor.
@@ -185,6 +186,30 @@ def _extract_weather_date(title: str, pos: Position, market: Market | None):
 
 def _whale_position_notional(whale_size: float, whale_avg: float) -> float:
     return max(0.0, whale_size * whale_avg)
+
+
+async def _opposite_side_avg_cost(session, condition_id: str, outcome: str) -> float | None:
+    """Weighted average entry price of our FILLED contracts on the OPPOSITE
+    outcome of the same market. Used by the hedge-cost gate."""
+    opposite = "NO" if outcome == "YES" else "YES"
+    result = await session.execute(
+        select(MyTrade).where(
+            and_(
+                MyTrade.condition_id == condition_id,
+                MyTrade.outcome == opposite,
+                MyTrade.fill_status.in_(("FILLED", "PARTIAL")),
+            )
+        )
+    )
+    total_size = 0
+    weighted = 0.0
+    for t in result.scalars().all():
+        n = int(t.num_contracts or 0)
+        p = float(t.entry_price or 0)
+        if n > 0 and p > 0:
+            total_size += n
+            weighted += n * p
+    return (weighted / total_size) if total_size > 0 else None
 
 
 async def _upsert_open_whale_position_from_api(
@@ -966,12 +991,58 @@ async def _evaluate_position(
             )
         return await finish("NO_VALID_PRICE", "price_above_max", requested_contracts=gap_contracts, filled_contracts=filled_contracts)
 
+    # Hedge-cost gate: if we already hold the opposite side, skip when the
+    # matched-pair cost (this BUY price + opposite-side avg cost) would exceed
+    # $1.00 — a guaranteed loss at resolution. Whales hedge their own
+    # positions; at our scale that just bleeds slippage.
+    opposite_avg = await _opposite_side_avg_cost(session, pos.condition_id, outcome)
+    if opposite_avg is not None and (order_price + opposite_avg) > 1.0:
+        opp = "NO" if outcome == "YES" else "YES"
+        if _note_decision(addr, pos.condition_id, outcome, "SKIP:hedge_cost_above_1"):
+            logger.info(
+                "SYNC: %s | hedge-cost: this %s @ $%.3f + existing %s avg $%.3f = $%.3f > $1 → SKIP hedge_cost_above_1",
+                mkt_tag, outcome, order_price, opp, opposite_avg, order_price + opposite_avg,
+            )
+        return await finish(
+            "hedge_cost_above_1",
+            f"hedge_cost_above_1:{order_price + opposite_avg:.3f}",
+            filled_contracts=filled_contracts,
+        )
+
     contracts = min(gap_contracts, buffered_gap_contracts)
     # Fast-track whale gets a flat $200 nibble per websocket event regardless of
     # how small his actual buy was. Wallet floor (MIN_WALLET_USDC, gated upstream
-    # via allow_new_buys) and the per-order nibble cap below are the only bounds.
+    # via allow_new_buys), the per-position cap below, and the per-order nibble
+    # cap further down are the only bounds.
     if fast_mode:
         contracts = max(contracts, int(nibble_cap_usdc / order_price))
+
+    # Per-position cap — total notional on this condition_id+outcome ≤ MAX_POSITION_USDC.
+    # Size down (or skip) if this order would push exposure past the cap.
+    current_exposure_usdc = exposure.effective_usdc
+    allowed_additional_usdc = max(0.0, MAX_POSITION_USDC - current_exposure_usdc)
+    gap_usdc = contracts * order_price
+    if gap_usdc > allowed_additional_usdc:
+        capped_contracts = int(allowed_additional_usdc / order_price)
+        if capped_contracts * order_price < MIN_NOTIONAL_USDC:
+            if _note_decision(addr, pos.condition_id, outcome, "SKIP:position_cap"):
+                logger.info(
+                    "SYNC: %s | gap %d @ $%.2f = $%.2f | at/over position cap $%.2f (current $%.2f) → SKIP position_cap",
+                    mkt_tag, contracts, order_price, gap_usdc,
+                    MAX_POSITION_USDC, current_exposure_usdc,
+                )
+            return await finish("position_cap", filled_contracts=filled_contracts)
+        logger.info(
+            "SYNC: %s | sizing down %d → %d contracts (position cap $%.2f, current $%.2f)",
+            mkt_tag, contracts, capped_contracts, MAX_POSITION_USDC, current_exposure_usdc,
+        )
+        contracts = capped_contracts
+    decision_context.update(
+        {
+            "position_cap_usdc": MAX_POSITION_USDC,
+            "allowed_additional_usdc": round(allowed_additional_usdc, 2),
+        }
+    )
 
     # Per-order nibble cap: never place > nibble_cap_usdc notional in one order.
     per_order_cap_contracts = int(nibble_cap_usdc / order_price)
@@ -997,7 +1068,7 @@ async def _evaluate_position(
             logger.info("SYNC: %s | order notional under CLOB $1 min → SKIP", mkt_tag)
         return await finish("under_min", "under_min_notional", requested_contracts=contracts, filled_contracts=filled_contracts)
 
-    taker_amount_usdc = round(min(contracts * order_price, nibble_cap_usdc), 2)
+    taker_amount_usdc = round(min(contracts * order_price, nibble_cap_usdc, allowed_additional_usdc), 2)
     decision_context["taker_amount_usdc"] = taker_amount_usdc
     if taker_amount_usdc < MIN_NOTIONAL_USDC:
         if _note_decision(addr, pos.condition_id, outcome, "SKIP:under_min_notional"):

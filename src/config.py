@@ -87,9 +87,10 @@ class Settings(BaseSettings):
     ]
 
     # Copy sizing — mirror a fraction of the whale's *share count* PER WHALE.
-    # With 3 whales and overlap possible on same markets, 1.0 keeps combined exposure manageable.
-    # Each order is capped at $200 notional (MAX_ORDER_USDC in sync_positions.py).
-    # Trading halts when wallet balance falls to MIN_WALLET_USDC ($50) — no per-position cap.
+    # With 8 whales and overlap possible on same markets, 1.0 keeps combined exposure manageable.
+    # Each order is capped at $200 notional (MAX_ORDER_USDC in sync_positions.py)
+    # and each per-market position is capped at $400 total (MAX_POSITION_USDC,
+    # same file). Trading halts when wallet balance falls to MIN_WALLET_USDC ($50).
     position_size_fraction: float = 1.0
 
     # Per-whale sizing override. Multiplied into the global position_size_fraction
