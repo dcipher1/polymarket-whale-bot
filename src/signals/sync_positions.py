@@ -70,6 +70,7 @@ MAX_POSITION_USDC = 400.0  # Per-position cap — total exposure on a single con
 FAST_MAX_PRICE = 0.90      # Fast-execution absolute price ceiling (settings.fast_execution_whales).
 FAST_MAX_ORDER_USDC = 200.0  # Fast-execution per-order nibble (matches default).
 MIN_WALLET_USDC = 50.0     # Halt new BUYs when pUSD balance falls to this floor.
+WHALE_TRADE_STALENESS_HOURS = 2  # Skip initiating a copy if whale's latest BUY is older than this.
 LOW_PRICE_OBSERVATION = 0.10  # Log low average entries, but do not hard-skip real aggregate positions.
 COPY_TARGET_BUFFER_FRAC = 1.05  # Allow only 5% above the watched whale's visible size.
 TERMINAL_FILL = {"FILLED", "PARTIAL"}
@@ -186,6 +187,30 @@ def _extract_weather_date(title: str, pos: Position, market: Market | None):
 
 def _whale_position_notional(whale_size: float, whale_avg: float) -> float:
     return max(0.0, whale_size * whale_avg)
+
+
+async def _latest_whale_buy_age_seconds(
+    session, wallet: str, condition_id: str, outcome: str
+) -> int | None:
+    """Seconds since the most recent BUY by this whale on (condition_id, outcome).
+    None if no whale_trade record exists for this combination."""
+    result = await session.execute(
+        select(WhaleTrade.timestamp)
+        .where(
+            and_(
+                WhaleTrade.wallet_address == wallet.lower(),
+                WhaleTrade.condition_id == condition_id,
+                WhaleTrade.outcome == outcome,
+                WhaleTrade.side == "BUY",
+            )
+        )
+        .order_by(WhaleTrade.timestamp.desc())
+        .limit(1)
+    )
+    ts = result.scalar_one_or_none()
+    if ts is None:
+        return None
+    return int((datetime.now(timezone.utc) - ts).total_seconds())
 
 
 async def _opposite_side_avg_cost(session, condition_id: str, outcome: str) -> float | None:
@@ -803,6 +828,23 @@ async def _evaluate_position(
     filled_contracts = exposure.filled_contracts
     reserved_contracts = exposure.reserved_pending_contracts
     effective_contracts = exposure.effective_contracts
+
+    # Staleness gate — don't INITIATE a copy on a whale buy older than the
+    # threshold. Once we already have exposure, the whale's old action is
+    # moot; we manage existing copies as usual (they're our own commitment).
+    if filled_contracts == 0 and reserved_contracts == 0:
+        age_s = await _latest_whale_buy_age_seconds(
+            session, addr, pos.condition_id, outcome
+        )
+        threshold_s = WHALE_TRADE_STALENESS_HOURS * 3600
+        if age_s is None or age_s > threshold_s:
+            age_label = f"{age_s/3600:.1f}h" if age_s is not None else "no_record"
+            if _note_decision(addr, pos.condition_id, outcome, f"SKIP:stale_signal:{age_label}"):
+                logger.info(
+                    "SYNC: %s | latest whale BUY age %s > %dh threshold → SKIP stale_signal",
+                    mkt_tag, age_label, WHALE_TRADE_STALENESS_HOURS,
+                )
+            return await finish("stale_signal", f"stale_signal:{age_label}")
     copy_target = _copy_target(whale_size, effective_contracts, multiplier=size_multiplier)
     target_contracts = copy_target.target_contracts
     max_target_contracts = copy_target.max_target_contracts
@@ -1068,12 +1110,38 @@ async def _evaluate_position(
             logger.info("SYNC: %s | order notional under CLOB $1 min → SKIP", mkt_tag)
         return await finish("under_min", "under_min_notional", requested_contracts=contracts, filled_contracts=filled_contracts)
 
-    taker_amount_usdc = round(min(contracts * order_price, nibble_cap_usdc, allowed_additional_usdc), 2)
+    # Don't try to spend more than (wallet - floor) on a single order.
+    # Without this clamp the bot queues full-nibble FAKs that CLOB rejects
+    # with "not enough balance / allowance" when wallet is between $50 floor
+    # and the nibble cap.
+    available_usdc = max(0.0, wallet_usdc - MIN_WALLET_USDC)
+    taker_amount_usdc = round(
+        min(contracts * order_price, nibble_cap_usdc, allowed_additional_usdc, available_usdc),
+        2,
+    )
     decision_context["taker_amount_usdc"] = taker_amount_usdc
     if taker_amount_usdc < MIN_NOTIONAL_USDC:
-        if _note_decision(addr, pos.condition_id, outcome, "SKIP:under_min_notional"):
-            logger.info("SYNC: %s | FAK amount $%.2f under CLOB $1 min → SKIP", mkt_tag, taker_amount_usdc)
-        return await finish("under_min", "under_min_notional", requested_contracts=contracts, filled_contracts=filled_contracts)
+        # Distinguish "wallet too thin" from "intent too small" for the log/decision tag.
+        if available_usdc < MIN_NOTIONAL_USDC:
+            tag = "SKIP:insufficient_balance"
+            code = "insufficient_balance"
+            msg = (
+                f"SYNC: %s | FAK amount $%.2f under CLOB $1 min "
+                f"(wallet $%.2f, floor $%.2f) → SKIP insufficient_balance"
+            )
+            args = (mkt_tag, taker_amount_usdc, wallet_usdc, MIN_WALLET_USDC)
+        else:
+            tag = "SKIP:under_min_notional"
+            code = "under_min_notional"
+            msg = "SYNC: %s | FAK amount $%.2f under CLOB $1 min → SKIP"
+            args = (mkt_tag, taker_amount_usdc)
+        if _note_decision(addr, pos.condition_id, outcome, tag):
+            logger.info(msg, *args)
+        return await finish("under_min" if code == "under_min_notional" else "insufficient_balance",
+                            code, requested_contracts=contracts, filled_contracts=filled_contracts)
+    # Clamp contract count down so we don't try to buy more shares than we can pay for.
+    if taker_amount_usdc < contracts * order_price:
+        contracts = int(taker_amount_usdc / order_price)
 
     if settings.live_execution_enabled:
         taker_result = await place_taker_buy(
