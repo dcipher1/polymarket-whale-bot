@@ -277,6 +277,15 @@ def _make_event(
         return None
     if price <= 0 or contracts <= 0:
         return None
+    # Polymarket binary outcome prices are bounded in [0, 1]. PolyNode has
+    # occasionally delivered malformed events with price > 1 (seen: 110.11)
+    # that overflow whale_trades.price NUMERIC(8,6) and crash the WS handler.
+    if price > 1.0:
+        logger.warning(
+            "Discarding malformed PolyNode event: price=%s > 1.0 wallet=%s cid=%s contracts=%s",
+            price, wallet[:10], condition_id[:10], contracts,
+        )
+        return None
 
     tx_hash = _event_id(msg, data)
     if not tx_hash:
