@@ -13,7 +13,7 @@ from sqlalchemy import select, and_, desc
 
 from src.config import settings
 from src.db import async_session
-from src.models import MyTrade
+from src.models import MyTrade, WhalePosition
 from src.polymarket.data_api import DataAPIClient
 from src.indexer.market_ingester import ensure_market
 
@@ -32,11 +32,26 @@ async def reconcile_positions() -> dict:
 
     client = DataAPIClient()
     try:
-        active_positions = await client.get_positions(wallet)
-        closed_positions = await client.get_closed_positions(wallet)
-        all_activity = await client.get_all_activity(wallet)
+        try:
+            active_positions = await client.get_positions(wallet)
+        except Exception as e:
+            logger.warning("RECONCILE: get_positions failed: %s", e)
+            active_positions = []
+        try:
+            closed_positions = await client.get_closed_positions(wallet)
+        except Exception as e:
+            logger.warning("RECONCILE: get_closed_positions failed: %s", e)
+            closed_positions = []
+        try:
+            all_activity = await client.get_all_activity(wallet)
+        except Exception as e:
+            logger.warning("RECONCILE: get_all_activity failed: %s", e)
+            all_activity = []
     finally:
-        await client.close()
+        try:
+            await client.close()
+        except Exception:
+            pass
 
     # Build one entry per (condition_id, outcome) from all sources
     # Priority: positions > closed-positions > activity sells
@@ -49,24 +64,32 @@ async def reconcile_positions() -> dict:
         outcome = (p.outcome or "YES").upper()
         key = (p.condition_id, outcome)
         cur_price = float(p.cur_price or 0)
-        pnl = float(p.realized_pnl or 0)
+        avg_entry = float(p.avg_price or 0)
+        size = float(p.size or 0)
+        api_pnl = float(p.realized_pnl or 0)
 
         if cur_price >= 0.99 or cur_price <= 0.01:
-            # Terminal price — resolved even if still in wallet
+            # Terminal price — effectively resolved even if not yet settled
+            # on-chain. Polymarket's realized_pnl is 0 for active positions
+            # (only filled on sell/settlement), so compute implied PnL from
+            # the terminal cur_price ourselves: (cur_price - avg_entry) * size.
+            # This captures the locked-in MTM correctly. When the market
+            # actually settles, resolution.py overwrites with PM truth.
+            implied_pnl = (cur_price - avg_entry) * size
             pm_data[key] = {
-                "entry_price": float(p.avg_price or 0),
-                "num_contracts": float(p.size or 0),
+                "entry_price": avg_entry,
+                "num_contracts": size,
                 "cur_price": cur_price,
-                "realized_pnl": pnl,
+                "realized_pnl": implied_pnl,
                 "resolved": True,
                 "slug": p.slug or "",
             }
         else:
             pm_data[key] = {
-                "entry_price": float(p.avg_price or 0),
-                "num_contracts": float(p.size or 0),
+                "entry_price": avg_entry,
+                "num_contracts": size,
                 "cur_price": cur_price,
-                "realized_pnl": pnl,
+                "realized_pnl": api_pnl,
                 "resolved": False,
                 "slug": p.slug or "",
             }
@@ -183,6 +206,53 @@ async def reconcile_positions() -> dict:
                 )
             else:
                 changed = _apply_active_position_to_trades(trades, data)
+                # If local nibbles diverge from PM truth and no reconciled
+                # placeholder exists yet, import a new "reconciled" row for
+                # the delta. Captures positions silently acquired by orders
+                # the bot wrote off as CANCELLED (e.g. legacy DELAYED FAKs).
+                economic = [t for t in trades if t.fill_status in ECONOMIC_FILL_STATUSES]
+                has_reconciled = any(
+                    (t.attribution or {}).get("source") == "reconciled"
+                    for t in economic
+                )
+                local_sum = sum(int(t.num_contracts or 0) for t in economic)
+                delta = int(data["num_contracts"]) - local_sum
+                if not has_reconciled and delta >= 1:
+                    market = await ensure_market(cid, session, slug=data.get("slug"))
+                    if market:
+                        avg = float(data["entry_price"])
+                        # Attribute the delta to the watched whale that held the
+                        # largest open position on this (cid, outcome). Without
+                        # this, _trade_is_attributed_to skips the row and the
+                        # whale's exposure is undercounted on the next cycle.
+                        attributed_wallet = await _dominant_watched_whale(
+                            session, cid, outcome
+                        )
+                        new_trade = MyTrade(
+                            signal_id=None,
+                            condition_id=cid,
+                            outcome=outcome,
+                            entry_price=Decimal(str(round(avg, 6))),
+                            size_usdc=Decimal(str(round(delta * avg, 2))),
+                            num_contracts=delta,
+                            fill_status="FILLED",
+                            entry_timestamp=datetime.now(timezone.utc),
+                            resolved=False,
+                            source_wallets=[attributed_wallet] if attributed_wallet else [],
+                            attribution={
+                                "source": "reconciled",
+                                "delta_absorber": True,
+                                "source_wallet": attributed_wallet or "",
+                            },
+                        )
+                        session.add(new_trade)
+                        logger.info(
+                            "RECONCILE: imported delta %d contracts on %s %s (local=%d, pm=%d, attr=%s)",
+                            delta, cid[:12], outcome, local_sum, int(data["num_contracts"]),
+                            (attributed_wallet or "none")[:12],
+                        )
+                        imported += 1
+                        changed = False  # already accounted via imported counter
 
             if changed:
                 updated += 1
@@ -262,19 +332,30 @@ def _apply_resolved_position_to_trades(
 
 
 def _apply_active_position_to_trades(trades: Sequence[MyTrade], data: dict) -> bool:
+    """Reconcile local economic fills against PM truth for an open position.
+
+    Local original-source rows record actual nibble-level fills; we keep their
+    per-row entry prices intact. PM truth (size, avg) gets absorbed into a
+    reconciled placeholder row for any delta between local sum and PM size, so
+    nibbled positions whose local total drifts from PM still surface the gap.
+    """
     changed = False
-    reconciled = [
-        t for t in trades
-        if (t.attribution or {}).get("source") == "reconciled"
-        and t.fill_status in ECONOMIC_FILL_STATUSES
-    ]
-    if len(reconciled) == 1:
-        trade = reconciled[0]
-        pm_shares = int(data["num_contracts"])
-        if abs((trade.num_contracts or 0) - pm_shares) > 0.5:
-            trade.num_contracts = pm_shares
-            trade.entry_price = Decimal(str(round(data["entry_price"], 6)))
-            trade.size_usdc = Decimal(str(round(data["num_contracts"] * data["entry_price"], 2)))
+    economic = [t for t in trades if t.fill_status in ECONOMIC_FILL_STATUSES]
+    reconciled = [t for t in economic if (t.attribution or {}).get("source") == "reconciled"]
+
+    pm_shares = int(data["num_contracts"])
+    pm_avg = float(data["entry_price"])
+    local_sum = sum(int(t.num_contracts or 0) for t in economic)
+    delta = pm_shares - local_sum
+
+    if reconciled and abs(delta) >= 1:
+        # Use the most recent reconciled row to absorb the local-vs-PM gap.
+        absorber = reconciled[-1]
+        target = max(0, int(absorber.num_contracts or 0) + delta)
+        if abs(int(absorber.num_contracts or 0) - target) >= 1:
+            absorber.num_contracts = target
+            absorber.entry_price = Decimal(str(round(pm_avg, 6)))
+            absorber.size_usdc = Decimal(str(round(target * pm_avg, 2)))
             changed = True
 
     for trade in trades:
@@ -287,3 +368,25 @@ def _apply_active_position_to_trades(trades: Sequence[MyTrade], data: dict) -> b
             changed = True
 
     return changed
+
+
+async def _dominant_watched_whale(session, condition_id: str, outcome: str) -> str | None:
+    """Return the watched whale with the largest open position on (cid, outcome)."""
+    watch = [w.lower() for w in (settings.watch_whales or [])]
+    if not watch:
+        return None
+    result = await session.execute(
+        select(WhalePosition.wallet_address, WhalePosition.num_contracts)
+        .where(
+            and_(
+                WhalePosition.condition_id == condition_id,
+                WhalePosition.outcome == outcome,
+                WhalePosition.is_open == True,
+                WhalePosition.wallet_address.in_(watch),
+            )
+        )
+        .order_by(desc(WhalePosition.num_contracts))
+        .limit(1)
+    )
+    row = result.first()
+    return row[0] if row else None
