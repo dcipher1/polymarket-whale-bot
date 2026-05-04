@@ -79,7 +79,8 @@ class Settings(BaseSettings):
         "0x8aa29c27241b6909a7c4d6cb4f400267aa215a0b",   # US specialist (existing) — Miami/NYC/Denver/Seattle/SF/Atlanta/Austin
         "0x672fe5d8a7b946fa9bff1b902a44a56718a213cc",   # Madrid/Istanbul/Lucknow (existing)
         "0x906f2454a777600aea6c506247566decef82371a",   # $22k LT — London/Seoul/Ankara/Chicago
-        "0xaa930fdc4caa3c0f6067404a7bd7899ca45f0bc7",   # Taipei/Sao Paulo/Shenzhen
+        # 0xaa930fdc REMOVED 2026-05-03: longshot-YES strategy needs many bets; lost
+        # us $864 over last 7d (208/277 bets lost). Uncopyable at $2k bankroll.
         "0xb94aa26e2844c47232377604c6001e88f8a5d680",   # China specialist (Guangzhou/Wuhan/Shanghai/Chengdu/Beijing — measured PFs)
         "0xf7a4f1a3716f79e4f588642b5d60e61ddc1cf148",   # Houston (only)
         "0x044f334595a7fd42c143e11c8ec47f23c8d1d1f1",   # Wellington/BA/Dallas/Paris/Toronto/Singapore/Warsaw
@@ -123,9 +124,7 @@ class Settings(BaseSettings):
         "0x906f2454a777600aea6c506247566decef82371a": [
             "London", "Seoul", "Ankara", "Chicago",
         ],
-        "0xaa930fdc4caa3c0f6067404a7bd7899ca45f0bc7": [
-            "Taipei", "Sao Paulo", "Shenzhen",
-        ],
+        # 0xaa930fdc removed 2026-05-03 (see watch_whales comment)
         "0xb94aa26e2844c47232377604c6001e88f8a5d680": [
             "Guangzhou", "Wuhan", "Shanghai", "Chengdu", "Beijing",
         ],
