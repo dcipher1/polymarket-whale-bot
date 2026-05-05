@@ -1,7 +1,7 @@
 from typing import Annotated
 
 from pydantic_settings import BaseSettings, NoDecode
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 
 class Settings(BaseSettings):
@@ -75,16 +75,18 @@ class Settings(BaseSettings):
     # Hardcoded whale allowlist — the only wallets we copy (no scoring, no discovery).
     # All three are hold-to-resolution weather traders. MyTrade.source_wallets tags each
     # fill with the originating whale so we can break PnL down per-whale.
+    # 8 whales by belief-edge calibration + city specialization + currently
+    # profitable (1w PnL ≥ $0). Refreshed 2026-05-05.
+    # Each whale ONLY trades their assigned cities (see watch_whale_cities).
     watch_whales: list[str] = [
-        "0x8aa29c27241b6909a7c4d6cb4f400267aa215a0b",   # US specialist (existing) — Miami/NYC/Denver/Seattle/SF/Atlanta/Austin
-        "0x672fe5d8a7b946fa9bff1b902a44a56718a213cc",   # Madrid/Istanbul/Lucknow (existing)
-        "0x906f2454a777600aea6c506247566decef82371a",   # $22k LT — London/Seoul/Ankara/Chicago
-        # 0xaa930fdc REMOVED 2026-05-03: longshot-YES strategy needs many bets; lost
-        # us $864 over last 7d (208/277 bets lost). Uncopyable at $2k bankroll.
-        "0xb94aa26e2844c47232377604c6001e88f8a5d680",   # China specialist (Guangzhou/Wuhan/Shanghai/Chengdu/Beijing — measured PFs)
-        "0xf7a4f1a3716f79e4f588642b5d60e61ddc1cf148",   # Houston (only)
-        "0x044f334595a7fd42c143e11c8ec47f23c8d1d1f1",   # Wellington/BA/Dallas/Paris/Toronto/Singapore/Warsaw
-        "0xc1200dd35a85da9b9ba552582d6103dd3d39a7e3",   # International multi-city (HK/Tel Aviv/Chongqing/LA/Amsterdam/Helsinki/Jakarta/Busan/Lagos/Cape Town)
+        "0xf59026150af59ec41e85be554fcfae137ed6303c",   # +57.2% London/Shanghai/Seoul
+        "0x35c4316574a4649865095ee9fe0c206005f6d144",   # +40.7% Seattle/Wellington
+        "0x5264b001677b47dd2e20fe20213749dbd7909a63",   # +37.8% Helsinki/Chengdu/Taipei
+        "0x3024712d12a75c911f8abf2a88ad44e3a4778ece",   # +36.6% Toronto/Madrid
+        "0x8c994f56c15feb7086f4de73e8908ad2c8123ef0",   # +36.1% Paris
+        "0x044f334595a7fd42c143e11c8ec47f23c8d1d1f1",   # +34.3% NYC (top performer)
+        "0xae68539542db9d69e66445c21e6e3bdde417064a",   # +30.4% Beijing/Chicago
+        "0x8aa29c27241b6909a7c4d6cb4f400267aa215a0b",   # +29.8% Miami/Houston/Austin
     ]
 
     # Copy sizing — mirror a fraction of the whale's *share count* PER WHALE.
@@ -94,50 +96,52 @@ class Settings(BaseSettings):
     # same file). Trading halts when wallet balance falls to MIN_WALLET_USDC ($50).
     position_size_fraction: float = 1.0
 
-    # Per-whale sizing override. Multiplied into the global position_size_fraction
-    # so a value of 2.0 means we copy 2x that whale's share count. Addresses must
-    # be lowercase. The per-position 10% bankroll cap still applies as a backstop.
-    position_size_multipliers: dict[str, float] = {
-        "0x8aa29c27241b6909a7c4d6cb4f400267aa215a0b": 3.0,  # best-ROI US whale, small avg trade
-        "0x672fe5d8a7b946fa9bff1b902a44a56718a213cc": 2.0,  # EU/MENA, +54% capture today
-        # 0x9c68b13a fast-track whale: scaled via FAST_MAX_ORDER_USDC nibble cap.
-        # 0xaa930fdc Asia: stays 1x — negative ROI, don't amplify.
-    }
-
     # Fast-execution whales — websocket-driven BUYs from these wallets bypass
     # the whale_avg×1.05 slippage band and bid up to FAST_MAX_PRICE with a
     # FAST_MAX_ORDER_USDC nibble. Env: FAST_EXECUTION_WHALES (comma-separated).
     fast_execution_whales: Annotated[list[str], NoDecode] = []
 
-    # Per-whale city allowlist. Signals from a whale only fire if the market's
-    # city (extracted from slug via _city_from_slug in sync_positions.py) is
-    # in their list. Whales NOT in this dict have NO allowlist applied — they
-    # default to "copy any weather city". Source: whale_finder/allocate_cities.py
-    # output 2026-05-02 — each city assigned to the one whale with strongest edge.
+    # When True, for bucketed neg-risk events (multi-bucket weather markets) the bot
+    # picks a single bucket per event by computing the whale's max-payout-if-true
+    # across all buckets in the event, and only buys YES on that bucket. Skips every
+    # other bucket. See src/signals/event_pick.py.
+    event_pick_enabled: bool = False
+
+    # When True, replaces single-bucket picker with the belief-edge trader: infers
+    # whale's implied probability per bucket from their full position book,
+    # compares to live market prices, and trades any bucket with |edge| >= 3%.
+    # See src/signals/whale_belief.py and scripts/whale_belief_discovery.py for
+    # the calibration that picked these whales + modes. Mutually exclusive with
+    # event_pick_enabled (asserted at startup).
+    edge_trader_enabled: bool = False
+
+    # Per-whale inference mode for the belief-edge trader. Modes from
+    # whale_belief.py: "directional" | "size_weighted" | "price_complement".
+    # Picked from data/whale_belief_ranking.json (best mode per whale).
+    edge_trader_whales: dict[str, str] = {
+        "0xf59026150af59ec41e85be554fcfae137ed6303c": "size_weighted",  # +57.2%
+        "0x35c4316574a4649865095ee9fe0c206005f6d144": "directional",    # +40.7%
+        "0x5264b001677b47dd2e20fe20213749dbd7909a63": "directional",    # +37.8%
+        "0x3024712d12a75c911f8abf2a88ad44e3a4778ece": "directional",    # +36.6%
+        "0x8c994f56c15feb7086f4de73e8908ad2c8123ef0": "directional",    # +36.1%
+        "0x044f334595a7fd42c143e11c8ec47f23c8d1d1f1": "size_weighted",  # +34.3%
+        "0xae68539542db9d69e66445c21e6e3bdde417064a": "size_weighted",  # +30.4%
+        "0x8aa29c27241b6909a7c4d6cb4f400267aa215a0b": "directional",    # +29.8%
+    }
+
+    # Per-whale city allowlist. ENFORCED in edge_trader path: each whale ONLY
+    # generates signals on events whose city is in their list. Refreshed
+    # 2026-05-05 from scripts/whale_city_allocator.py — picks each whale's top
+    # specialty cities (≥$100 PnL, ≥3 positions per city), no overlaps.
     watch_whale_cities: dict[str, list[str]] = {
-        "0x8aa29c27241b6909a7c4d6cb4f400267aa215a0b": [
-            "Miami", "NYC", "Denver", "Seattle", "San Francisco", "Atlanta", "Austin",
-        ],
-        "0x672fe5d8a7b946fa9bff1b902a44a56718a213cc": [
-            "Madrid", "Istanbul", "Lucknow",
-        ],
-        "0x906f2454a777600aea6c506247566decef82371a": [
-            "London", "Seoul", "Ankara", "Chicago",
-        ],
-        # 0xaa930fdc removed 2026-05-03 (see watch_whales comment)
-        "0xb94aa26e2844c47232377604c6001e88f8a5d680": [
-            "Guangzhou", "Wuhan", "Shanghai", "Chengdu", "Beijing",
-        ],
-        "0xf7a4f1a3716f79e4f588642b5d60e61ddc1cf148": [
-            "Houston",
-        ],
-        "0x044f334595a7fd42c143e11c8ec47f23c8d1d1f1": [
-            "Wellington", "Buenos Aires", "Dallas", "Paris", "Toronto", "Singapore", "Warsaw",
-        ],
-        "0xc1200dd35a85da9b9ba552582d6103dd3d39a7e3": [
-            "Hong Kong", "Tel Aviv", "Chongqing", "Los Angeles", "Amsterdam",
-            "Helsinki", "Jakarta", "Busan", "Lagos", "Cape Town",
-        ],
+        "0xf59026150af59ec41e85be554fcfae137ed6303c": ["London", "Shanghai", "Seoul"],
+        "0x35c4316574a4649865095ee9fe0c206005f6d144": ["Seattle", "Wellington"],
+        "0x5264b001677b47dd2e20fe20213749dbd7909a63": ["Helsinki", "Chengdu", "Taipei"],
+        "0x3024712d12a75c911f8abf2a88ad44e3a4778ece": ["Toronto", "Madrid"],
+        "0x8c994f56c15feb7086f4de73e8908ad2c8123ef0": ["Paris"],
+        "0x044f334595a7fd42c143e11c8ec47f23c8d1d1f1": ["NYC"],
+        "0xae68539542db9d69e66445c21e6e3bdde417064a": ["Beijing", "Chicago"],
+        "0x8aa29c27241b6909a7c4d6cb4f400267aa215a0b": ["Miami", "Houston", "Austin"],
     }
 
     # Wallet freshness
@@ -243,6 +247,15 @@ class Settings(BaseSettings):
         if isinstance(v, list):
             return [str(w).strip().lower() for w in v if str(w).strip()]
         return v or []
+
+    @model_validator(mode="after")
+    def _check_signal_mode_mutex(self):
+        if self.event_pick_enabled and self.edge_trader_enabled:
+            raise ValueError(
+                "event_pick_enabled and edge_trader_enabled are mutually exclusive — "
+                "set one to false."
+            )
+        return self
 
     _SENSITIVE_FIELDS = {
         "polymarket_private_key", "polymarket_api_key", "polymarket_api_secret",

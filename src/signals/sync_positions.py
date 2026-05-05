@@ -47,6 +47,12 @@ from src.models import CopyDecision, Market, MarketToken, MyTrade, WhalePosition
 from src.polymarket.clob_client import CLOBClient
 from src.polymarket.data_api import DataAPIClient, Position
 from src.polymarket.polynode_wallet_ws import WhaleTradeEvent, persist_whale_trade_event
+from src.signals.event_pick import implied_yes_bucket
+from src.signals.whale_belief import (
+    edge_per_bucket,
+    trade_decisions,
+    whale_implied_distribution,
+)
 from src.signals.weather_resolution import (
     MONTH_ABBR,
     effective_market_category,
@@ -70,6 +76,10 @@ MAX_POSITION_USDC = 400.0  # Per-position cap — total exposure on a single con
 FAST_MAX_PRICE = 0.90      # Fast-execution absolute price ceiling (settings.fast_execution_whales).
 FAST_MAX_ORDER_USDC = 200.0  # Fast-execution per-order nibble (matches default).
 MIN_WALLET_USDC = 50.0     # Halt new BUYs when pUSD balance falls to this floor.
+EVENT_PICK_MIN_CONTRACTS = 100  # Lower bound on event-pick targets (margin → 0).
+EVENT_PICK_MAX_CONTRACTS = 400  # Upper bound on event-pick targets (margin → 1).
+EDGE_TRADER_MAX_DIRECTION_USDC = 150.0  # Global per-cycle, per-direction (YES/NO) cap.
+EDGE_TRADER_MAX_PER_WHALE_DIRECTION_USDC = 50.0  # Per-whale per-cycle, per-direction cap.
 WHALE_TRADE_STALENESS_HOURS = 2  # Skip initiating a copy if whale's latest BUY is older than this.
 LOW_PRICE_OBSERVATION = 0.10  # Log low average entries, but do not hard-skip real aggregate positions.
 COPY_TARGET_BUFFER_FRAC = 1.05  # Allow only 5% above the watched whale's visible size.
@@ -393,10 +403,18 @@ class CopyTarget:
     buffered_gap_contracts: int
 
 
-def _copy_target(whale_size: float, effective_contracts: int, multiplier: float = 1.0) -> CopyTarget:
-    scaled = whale_size * settings.position_size_fraction * multiplier
-    target_contracts = int(round(scaled))
-    max_target_contracts = max(target_contracts, int(scaled * COPY_TARGET_BUFFER_FRAC))
+def _copy_target(
+    whale_size: float,
+    effective_contracts: int,
+    override_target: int | None = None,
+) -> CopyTarget:
+    if override_target is not None:
+        target_contracts = override_target
+        max_target_contracts = max(target_contracts, int(target_contracts * COPY_TARGET_BUFFER_FRAC))
+    else:
+        scaled = whale_size * settings.position_size_fraction
+        target_contracts = int(round(scaled))
+        max_target_contracts = max(target_contracts, int(scaled * COPY_TARGET_BUFFER_FRAC))
     return CopyTarget(
         target_contracts=target_contracts,
         max_target_contracts=max_target_contracts,
@@ -676,12 +694,10 @@ async def _evaluate_position(
         and addr.lower() in {w.lower() for w in (settings.fast_execution_whales or [])}
     )
     nibble_cap_usdc = FAST_MAX_ORDER_USDC if fast_mode else MAX_ORDER_USDC
-    size_multiplier = settings.position_size_multipliers.get(addr.lower(), 1.0)
     decision_context = {
         "wallet_usdc": round(wallet_usdc, 6),
         "allow_new_buys": allow_new_buys,
         "position_size_fraction": settings.position_size_fraction,
-        "size_multiplier": size_multiplier,
         "max_order_usdc": nibble_cap_usdc,
         "fast_mode": fast_mode,
     }
@@ -717,6 +733,11 @@ async def _evaluate_position(
 
     if outcome not in ("YES", "NO") or not pos.condition_id:
         return await finish("invalid", "invalid_outcome_or_condition")
+    # When edge trader is enabled, all execution flows through the per-event
+    # poll dispatch (_dispatch_edge_trader_for_whale). The websocket path still
+    # persists the whale's trade but does not trigger 1:1 copy.
+    if settings.edge_trader_enabled and addr.lower() in settings.edge_trader_whales:
+        return await finish("edge_trader_handled_via_poll", "edge_trader_enabled")
     # Keep whale_size as float — fractional positions (e.g. 0.28 contracts) are
     # legitimate; downstream gates (under_min_contracts) will skip too-small
     # whales with a clearer reason than "whale_empty".
@@ -752,6 +773,33 @@ async def _evaluate_position(
 
     # Compute the readable tag early so cancel logs can use it too.
     mkt_tag = _mkt_tag(market.question or pos.title, outcome, pos.end_date)
+
+    # Bucketed-event gate: for multi-bucket neg-risk events, only buy YES on the
+    # single bucket whose YES-resolution would pay the whale the most given their
+    # current holdings. See src/signals/event_pick.py.
+    event_pick_target: int | None = None
+    if settings.event_pick_enabled and market.neg_risk and market.event_id:
+        pick_cid, pick_ctx = await implied_yes_bucket(session, addr, market.event_id)
+        decision_context["event_pick"] = pick_ctx
+        if pick_cid is None:
+            logger.info("SYNC: %s | SKIP event_no_pick reason=%s",
+                        mkt_tag, pick_ctx.get("reason", "unknown"))
+            return await finish("event_no_pick", pick_ctx.get("reason", "unknown"))
+        if pick_cid != pos.condition_id or outcome != "YES":
+            logger.info("SYNC: %s | SKIP event_not_picked picked=%s_YES this=%s_%s",
+                        mkt_tag, pick_cid[:10], pos.condition_id[:10], outcome)
+            return await finish(
+                "event_not_picked_bucket",
+                f"picked={pick_cid[:10]}_YES; this={pos.condition_id[:10]}_{outcome}",
+            )
+        # Pick survived → size the trade by the picker's margin (conviction).
+        margin = float(pick_ctx.get("margin", 0.0))
+        pick_payout = float(pick_ctx.get("pick_payout", 0.0)) or 1.0
+        margin_ratio = max(0.0, min(1.0, margin / pick_payout))
+        span = EVENT_PICK_MAX_CONTRACTS - EVENT_PICK_MIN_CONTRACTS
+        event_pick_target = int(round(EVENT_PICK_MIN_CONTRACTS + span * margin_ratio))
+        decision_context["event_pick_margin_ratio"] = round(margin_ratio, 4)
+        decision_context["event_pick_target"] = event_pick_target
 
     # Per-whale city allowlist gate. Whales not listed in watch_whale_cities
     # bypass this filter (default: any weather city).
@@ -845,7 +893,11 @@ async def _evaluate_position(
                     mkt_tag, age_label, WHALE_TRADE_STALENESS_HOURS,
                 )
             return await finish("stale_signal", f"stale_signal:{age_label}")
-    copy_target = _copy_target(whale_size, effective_contracts, multiplier=size_multiplier)
+    copy_target = _copy_target(
+        whale_size,
+        effective_contracts,
+        override_target=event_pick_target,
+    )
     target_contracts = copy_target.target_contracts
     max_target_contracts = copy_target.max_target_contracts
     gap_contracts = copy_target.gap_contracts
@@ -1285,6 +1337,571 @@ async def _evaluate_position(
     )
 
 
+async def _record_edge_decision(
+    session,
+    *,
+    addr: str | None,
+    condition_id: str | None,
+    outcome: str | None,
+    code: str,
+    reason: str | None = None,
+    context: dict | None = None,
+) -> None:
+    """Thin wrapper around _record_copy_decision that pins decision_source for
+    the edge_trader path so every skip/exit produces a CopyDecision row."""
+    await _record_copy_decision(
+        session,
+        wallet_address=addr,
+        condition_id=condition_id,
+        outcome=outcome,
+        decision_code=code,
+        decision_reason=reason or code,
+        decision_source="edge_trader_poll",
+        context=context or {},
+    )
+
+
+async def _execute_edge_decision(
+    session,
+    addr: str,
+    event_id: str,
+    decision,
+    market_yes: float,
+    yes_token_id: str | None,
+    no_token_id: str | None,
+    wallet_usdc: float,
+    counts: dict[str, int],
+    mode: str,
+    cycle_spent: dict[str, float] | None = None,
+    whale_spent: dict[str, float] | None = None,
+) -> float:
+    """Place a single belief-edge trade. Mutates cycle_spent + whale_spent in place. Returns wallet_usdc."""
+    if cycle_spent is None:
+        cycle_spent = {"YES": 0.0, "NO": 0.0}
+    if whale_spent is None:
+        whale_spent = {"YES": 0.0, "NO": 0.0}
+    cid = decision.condition_id
+    side = decision.side
+    target_contracts = decision.target_contracts
+    edge = decision.edge
+    base_ctx = {
+        "event_id": event_id,
+        "mode": mode,
+        "edge": round(edge, 6),
+        "market_yes": round(market_yes, 6),
+        "target_contracts": target_contracts,
+    }
+    mkt_tag = f"event{event_id[:8]}_{cid[:10]}_{side}"
+
+    # Per-direction cycle caps (global + per-whale).
+    if cycle_spent.get(side, 0.0) >= EDGE_TRADER_MAX_DIRECTION_USDC:
+        code = f"{side.lower()}_cycle_cap"
+        counts[code] = counts.get(code, 0) + 1
+        logger.info("EDGE_SKIP: %s | %s spent=$%.2f >= cap $%.0f",
+                    mkt_tag, code, cycle_spent.get(side, 0.0), EDGE_TRADER_MAX_DIRECTION_USDC)
+        await _record_edge_decision(session, addr=addr, condition_id=cid, outcome=side,
+                                    code=code, context={**base_ctx, "cycle_spent_usdc": round(cycle_spent.get(side, 0.0), 2)})
+        return wallet_usdc
+    if whale_spent.get(side, 0.0) >= EDGE_TRADER_MAX_PER_WHALE_DIRECTION_USDC:
+        code = f"{side.lower()}_whale_cap"
+        counts[code] = counts.get(code, 0) + 1
+        logger.info("EDGE_SKIP: %s | %s spent=$%.2f >= cap $%.0f",
+                    mkt_tag, code, whale_spent.get(side, 0.0), EDGE_TRADER_MAX_PER_WHALE_DIRECTION_USDC)
+        await _record_edge_decision(session, addr=addr, condition_id=cid, outcome=side,
+                                    code=code, context={**base_ctx, "whale_spent_usdc": round(whale_spent.get(side, 0.0), 2)})
+        return wallet_usdc
+
+    token_id = yes_token_id if side == "YES" else no_token_id
+    if not token_id:
+        counts["no_token_id"] = counts.get("no_token_id", 0) + 1
+        logger.info("EDGE_SKIP: %s | no_token_id", mkt_tag)
+        await _record_edge_decision(session, addr=addr, condition_id=cid, outcome=side,
+                                    code="no_token_id", context=base_ctx)
+        return wallet_usdc
+
+    if side == "YES":
+        mid = market_yes
+    else:
+        mid = max(0.001, 1.0 - market_yes)
+    # Don't trade outside the 10c–90c band — extreme prices are either dust
+    # (low edge × low price = no real PnL) or near-resolved (you're paying for
+    # the consensus, not the edge).
+    if mid < 0.10 or mid > 0.90:
+        counts["price_out_of_band"] = counts.get("price_out_of_band", 0) + 1
+        logger.info("EDGE_SKIP: %s | price_out_of_band mid=%.3f", mkt_tag, mid)
+        await _record_edge_decision(session, addr=addr, condition_id=cid, outcome=side,
+                                    code="price_out_of_band", context={**base_ctx, "mid": round(mid, 6)})
+        return wallet_usdc
+    max_price = min(MAX_ORDER_PRICE, mid + 0.02)
+    if max_price < MIN_ORDER_PRICE or mid <= 0:
+        counts["price_below_min"] = counts.get("price_below_min", 0) + 1
+        logger.info("EDGE_SKIP: %s | price_below_min mid=%.5f max_price=%.5f", mkt_tag, mid, max_price)
+        await _record_edge_decision(session, addr=addr, condition_id=cid, outcome=side,
+                                    code="price_below_min", context={**base_ctx, "mid": round(mid, 6), "max_price": round(max_price, 6)})
+        return wallet_usdc
+
+    existing_trades = (await session.execute(
+        select(MyTrade).where(MyTrade.condition_id == cid).where(MyTrade.outcome == side)
+    )).scalars().all()
+    exposure = _copy_exposure(list(existing_trades))
+    remaining_position_usdc = max(0.0, MAX_POSITION_USDC - exposure.effective_usdc)
+    if remaining_position_usdc < 1.0:
+        counts["position_cap"] = counts.get("position_cap", 0) + 1
+        logger.info("EDGE_SKIP: %s | position_cap exposure=$%.2f / cap $%.0f",
+                    mkt_tag, exposure.effective_usdc, MAX_POSITION_USDC)
+        await _record_edge_decision(session, addr=addr, condition_id=cid, outcome=side,
+                                    code="position_cap",
+                                    context={**base_ctx, "current_exposure_usdc": round(exposure.effective_usdc, 2)})
+        return wallet_usdc
+
+    # Sizing: enforce a minimum $1.50 nibble (above CLOB $1 floor) — for cheap
+    # markets we scale contract count up to hit the floor, capped at 5× target
+    # so we don't buy thousands of "lottery tickets" on near-resolved buckets.
+    MIN_NIBBLE_USDC = 1.5
+    MAX_CONTRACT_SCALE = 5
+    global_remaining = max(0.0, EDGE_TRADER_MAX_DIRECTION_USDC - cycle_spent.get(side, 0.0))
+    whale_remaining = max(0.0, EDGE_TRADER_MAX_PER_WHALE_DIRECTION_USDC - whale_spent.get(side, 0.0))
+    cycle_remaining_usdc = min(global_remaining, whale_remaining)
+    desired_usdc = target_contracts * mid
+    nibble_usdc = max(desired_usdc, MIN_NIBBLE_USDC)
+    cap_usdc = min(
+        nibble_usdc, MAX_ORDER_USDC, remaining_position_usdc,
+        max(0.0, wallet_usdc - MIN_WALLET_USDC),
+        cycle_remaining_usdc,
+    )
+    if cap_usdc < MIN_NIBBLE_USDC:
+        counts["floor_or_cap"] = counts.get("floor_or_cap", 0) + 1
+        logger.info("EDGE_SKIP: %s | floor_or_cap cap_usdc=$%.2f cycle_rem=$%.2f wallet_rem=$%.2f",
+                    mkt_tag, cap_usdc, cycle_remaining_usdc, max(0.0, wallet_usdc - MIN_WALLET_USDC))
+        await _record_edge_decision(session, addr=addr, condition_id=cid, outcome=side,
+                                    code="floor_or_cap",
+                                    context={**base_ctx, "cap_usdc": round(cap_usdc, 2),
+                                             "cycle_remaining_usdc": round(cycle_remaining_usdc, 2)})
+        return wallet_usdc
+    actual_contracts = max(MIN_ORDER_CONTRACTS, int(cap_usdc / mid))
+    actual_contracts = min(actual_contracts, target_contracts * MAX_CONTRACT_SCALE)
+    actual_usdc = round(actual_contracts * mid, 2)
+    if actual_usdc < 1.0:
+        counts["mid_too_low"] = counts.get("mid_too_low", 0) + 1
+        logger.info(
+            "EDGE_SKIP: %s | mid_too_low mid=%.5f target=%d capped_c=%d actual_$=%.2f",
+            mkt_tag, mid, target_contracts, actual_contracts, actual_usdc,
+        )
+        await _record_edge_decision(session, addr=addr, condition_id=cid, outcome=side,
+                                    code="mid_too_low",
+                                    context={**base_ctx, "mid": round(mid, 6),
+                                             "actual_contracts": actual_contracts,
+                                             "actual_usdc": actual_usdc})
+        return wallet_usdc
+
+    if settings.live_execution_enabled:
+        result = await place_taker_buy(
+            token_id=token_id, amount_usdc=actual_usdc,
+            max_price=max_price, tag=mkt_tag,
+        )
+        order_id = result.order_id
+        immediate_fill = result.filled_contracts
+        avg_fill_price = result.avg_fill_price or mid
+        if not result.accepted or not order_id:
+            counts["FAK_REJECTED"] = counts.get("FAK_REJECTED", 0) + 1
+            logger.warning("EDGE_TRADE: %s | FAK rejected: %s", mkt_tag, result.error)
+            await _record_edge_decision(session, addr=addr, condition_id=cid, outcome=side,
+                                        code="FAK_REJECTED", reason=str(result.error or "rejected"),
+                                        context={**base_ctx, "actual_usdc": actual_usdc,
+                                                 "max_price": round(max_price, 6)})
+            return wallet_usdc
+    else:
+        result = None
+        order_id = f"paper_edge_{int(datetime.now(timezone.utc).timestamp() * 1000)}_{cid[:8]}"
+        immediate_fill = actual_contracts
+        avg_fill_price = mid
+
+    actual_filled = immediate_fill if immediate_fill > 0 else 0
+    # Polymarket DELAYED = FAK queued for async match. Order is STILL ACTIVE on
+    # PM and will likely fill — must record as PENDING so the reconciler can
+    # track it. Treating DELAYED as cancelled creates orphan positions.
+    is_delayed_async = (
+        settings.live_execution_enabled
+        and actual_filled <= 0
+        and (result.status or "").upper() == "DELAYED"
+        and result.accepted
+    )
+    if actual_filled <= 0 and not is_delayed_async:
+        counts["FAK_NO_FILL"] = counts.get("FAK_NO_FILL", 0) + 1
+        logger.info(
+            "EDGE_TRADE: %s mode=%s edge=%+.3f mkt_yes=%.3f → %s 0 @ %.3f → CANCELLED",
+            mkt_tag, mode, edge, market_yes, side, mid,
+        )
+        await _record_edge_decision(session, addr=addr, condition_id=cid, outcome=side,
+                                    code="FAK_NO_FILL",
+                                    context={**base_ctx, "mid": round(mid, 6),
+                                             "actual_usdc": actual_usdc,
+                                             "max_price": round(max_price, 6),
+                                             "order_id": order_id})
+        return wallet_usdc
+
+    if is_delayed_async:
+        fill_status = "PENDING"
+        actual_filled = actual_contracts  # reserve full requested for tracking
+        avg_fill_price = mid
+        size_usdc = round(actual_filled * avg_fill_price, 2)
+    else:
+        fill_status = "FILLED" if immediate_fill >= actual_contracts else "PARTIAL"
+        size_usdc = round(actual_filled * avg_fill_price, 2)
+    trade = MyTrade(
+        condition_id=cid, outcome=side,
+        entry_price=Decimal(str(round(avg_fill_price, 6))),
+        size_usdc=Decimal(str(size_usdc)),
+        num_contracts=actual_filled,
+        order_id=order_id, fill_status=fill_status,
+        entry_timestamp=datetime.now(timezone.utc),
+        source_wallets=[addr],
+        attribution={
+            "source": "edge_trader",
+            "event_id": event_id,
+            "mode": mode,
+            "edge": round(edge, 6),
+            "market_yes": round(market_yes, 6),
+            "target_contracts": target_contracts,
+            "requested_contracts": actual_contracts,
+            "requested_size_usdc": str(actual_usdc),
+            "max_price": round(max_price, 6),
+        },
+    )
+    session.add(trade)
+    await session.flush()
+    counts["BUY" if fill_status != "PENDING" else "FAK_DELAYED"] = (
+        counts.get("BUY" if fill_status != "PENDING" else "FAK_DELAYED", 0) + 1
+    )
+    cycle_spent[side] = cycle_spent.get(side, 0.0) + size_usdc
+    whale_spent[side] = whale_spent.get(side, 0.0) + size_usdc
+    logger.info(
+        "EDGE_TRADE: %s mode=%s edge=%+.3f mkt_yes=%.3f → %s %d @ %.3f → %s spent $%.2f "
+        "whale=$%.2f/$%.2f global=$%.2f/$%.2f",
+        mkt_tag, mode, edge, market_yes, side, actual_filled, avg_fill_price,
+        fill_status, size_usdc,
+        whale_spent.get("YES", 0.0), whale_spent.get("NO", 0.0),
+        cycle_spent.get("YES", 0.0), cycle_spent.get("NO", 0.0),
+    )
+    await _record_edge_decision(
+        session, addr=addr, condition_id=cid, outcome=side,
+        code="FAK_DELAYED" if fill_status == "PENDING" else "BUY",
+        reason="fak_queued_delayed" if fill_status == "PENDING" else (
+            "fak_filled" if fill_status == "FILLED" else "fak_partial"
+        ),
+        context={
+            **base_ctx,
+            "fill_status": fill_status,
+            "filled_contracts": actual_filled,
+            "avg_fill_price": round(avg_fill_price, 6),
+            "size_usdc": size_usdc,
+            "max_price": round(max_price, 6),
+            "order_id": order_id,
+            "my_trade_id": trade.id,
+        },
+    )
+    return wallet_usdc - size_usdc
+
+
+async def _evaluate_event_edge(
+    session,
+    addr: str,
+    event_id: str,
+    whale_positions: list[Position],
+    clob: CLOBClient,
+    wallet_usdc: float,
+    mode: str,
+    counts: dict[str, int],
+    cycle_spent: dict[str, float] | None = None,
+    whale_spent: dict[str, float] | None = None,
+) -> float:
+    """Run inference + edge + trade for one event. Mutates dicts in place. Returns wallet."""
+    if cycle_spent is None:
+        cycle_spent = {"YES": 0.0, "NO": 0.0}
+    if whale_spent is None:
+        whale_spent = {"YES": 0.0, "NO": 0.0}
+    result = await session.execute(
+        select(Market.condition_id).where(Market.event_id == event_id)
+    )
+    bucket_cids = [row[0] for row in result.all()]
+    if len(bucket_cids) < 2:
+        counts["single_bucket"] = counts.get("single_bucket", 0) + 1
+        logger.info("EDGE_SKIP: event=%s | single_bucket buckets=%d", event_id, len(bucket_cids))
+        await _record_edge_decision(
+            session, addr=addr, condition_id=None, outcome=None,
+            code="single_bucket",
+            context={"event_id": event_id, "mode": mode, "buckets": len(bucket_cids)},
+        )
+        return wallet_usdc
+
+    yes_avg, no_avg, yes_size, no_size = {}, {}, {}, {}
+    for pos in whale_positions:
+        side = (pos.outcome or "").upper()
+        try:
+            sz = float(pos.size or 0)
+            ap = float(pos.avg_price or 0)
+        except (TypeError, ValueError):
+            continue
+        if sz <= 0 or ap <= 0:
+            continue
+        if side == "YES":
+            yes_size[pos.condition_id] = sz
+            yes_avg[pos.condition_id] = ap
+        elif side == "NO":
+            no_size[pos.condition_id] = sz
+            no_avg[pos.condition_id] = ap
+
+    whale_p = whale_implied_distribution(
+        bucket_cids, yes_avg, no_avg, yes_size, no_size, mode=mode,
+    )
+
+    token_rows = (await session.execute(
+        select(MarketToken.condition_id, MarketToken.outcome, MarketToken.token_id)
+        .where(MarketToken.condition_id.in_(bucket_cids))
+    )).all()
+    yes_tokens: dict[str, str] = {}
+    no_tokens: dict[str, str] = {}
+    for cid, out, tid in token_rows:
+        if (out or "").upper() == "YES":
+            yes_tokens[cid] = tid
+        else:
+            no_tokens[cid] = tid
+
+    yes_tids = [yes_tokens[c] for c in bucket_cids if c in yes_tokens]
+    mids = await clob.get_midpoints(yes_tids) if yes_tids else {}
+    market_yes: dict[str, float] = {}
+    for cid in bucket_cids:
+        tid = yes_tokens.get(cid)
+        if not tid:
+            continue
+        m = mids.get(tid)
+        if m is not None and 0 < m < 1:
+            market_yes[cid] = m
+
+    edges = edge_per_bucket(whale_p, market_yes)
+    decisions = trade_decisions(edges)
+    # Pick exactly one bucket per event — the largest |edge|. Trading multiple
+    # buckets per event creates self-hedged books that lose in most outcomes.
+    if decisions:
+        decisions = [max(decisions, key=lambda d: abs(d.edge))]
+
+    logger.info(
+        "EDGE_EVAL whale=%s event=%s mode=%s buckets=%d priced=%d decisions=%d top_edges=%s",
+        addr[:10], event_id, mode, len(bucket_cids), len(market_yes), len(decisions),
+        {c[:10]: round(e, 3) for c, e in sorted(edges.items(), key=lambda kv: -abs(kv[1]))[:3]},
+    )
+
+    if not decisions:
+        counts["decisions_empty"] = counts.get("decisions_empty", 0) + 1
+        top = {c[:10]: round(e, 3) for c, e in sorted(edges.items(), key=lambda kv: -abs(kv[1]))[:3]}
+        logger.info(
+            "EDGE_SKIP: event=%s | decisions_empty (no bucket above edge threshold) top_edges=%s",
+            event_id, top,
+        )
+        await _record_edge_decision(
+            session, addr=addr, condition_id=None, outcome=None,
+            code="decisions_empty",
+            context={"event_id": event_id, "mode": mode, "top_edges": top,
+                     "buckets": len(bucket_cids), "priced": len(market_yes)},
+        )
+        return wallet_usdc
+
+    for d in decisions:
+        if wallet_usdc <= MIN_WALLET_USDC:
+            counts["wallet_floor"] = counts.get("wallet_floor", 0) + 1
+            logger.info("EDGE_SKIP: event=%s | wallet_floor wallet=$%.2f", event_id, wallet_usdc)
+            await _record_edge_decision(
+                session, addr=addr, condition_id=d.condition_id, outcome=d.side,
+                code="wallet_floor",
+                context={"event_id": event_id, "mode": mode, "wallet_usdc": round(wallet_usdc, 2)},
+            )
+            break
+        global_yes_full = cycle_spent.get("YES", 0.0) >= EDGE_TRADER_MAX_DIRECTION_USDC
+        global_no_full = cycle_spent.get("NO", 0.0) >= EDGE_TRADER_MAX_DIRECTION_USDC
+        whale_yes_full = whale_spent.get("YES", 0.0) >= EDGE_TRADER_MAX_PER_WHALE_DIRECTION_USDC
+        whale_no_full = whale_spent.get("NO", 0.0) >= EDGE_TRADER_MAX_PER_WHALE_DIRECTION_USDC
+        if (global_yes_full and global_no_full) or (whale_yes_full and whale_no_full):
+            code = "global_caps_full" if (global_yes_full and global_no_full) else "whale_caps_full"
+            counts[code] = counts.get(code, 0) + 1
+            logger.info(
+                "EDGE_SKIP: event=%s | %s global=YES$%.2f/NO$%.2f whale=YES$%.2f/NO$%.2f",
+                event_id, code,
+                cycle_spent.get("YES", 0.0), cycle_spent.get("NO", 0.0),
+                whale_spent.get("YES", 0.0), whale_spent.get("NO", 0.0),
+            )
+            await _record_edge_decision(
+                session, addr=addr, condition_id=d.condition_id, outcome=d.side,
+                code=code,
+                context={
+                    "event_id": event_id, "mode": mode,
+                    "global_yes": round(cycle_spent.get("YES", 0.0), 2),
+                    "global_no": round(cycle_spent.get("NO", 0.0), 2),
+                    "whale_yes": round(whale_spent.get("YES", 0.0), 2),
+                    "whale_no": round(whale_spent.get("NO", 0.0), 2),
+                },
+            )
+            break
+        wallet_usdc = await _execute_edge_decision(
+            session, addr, event_id, d, market_yes.get(d.condition_id, 0.0),
+            yes_tokens.get(d.condition_id), no_tokens.get(d.condition_id),
+            wallet_usdc, counts, mode, cycle_spent, whale_spent,
+        )
+    return wallet_usdc
+
+
+async def _dispatch_edge_trader_for_whale(
+    addr: str,
+    positions: list[Position],
+    clob: CLOBClient,
+    initial_wallet_usdc: float,
+    cycle_spent: dict[str, float] | None = None,
+    whale_spent: dict[str, float] | None = None,
+) -> tuple[dict[str, int], float]:
+    """Run belief-edge trader for one whale. Mutates cycle_spent + whale_spent in place. Returns (counts, wallet)."""
+    if cycle_spent is None:
+        cycle_spent = {"YES": 0.0, "NO": 0.0}
+    if whale_spent is None:
+        whale_spent = {"YES": 0.0, "NO": 0.0}
+    counts: dict[str, int] = {}
+    mode = settings.edge_trader_whales.get(addr.lower(), "directional")
+    wallet_usdc = initial_wallet_usdc
+
+    cid_to_market: dict[str, Market] = {}
+    # Per-whale city allowlist: each whale is a specialist; only fire signals on
+    # events whose city is in their assigned list. Whales not in the dict trade
+    # any city (legacy behavior).
+    allowed_cities = settings.watch_whale_cities.get(addr.lower())
+    events_to_eval: dict[str, list[Position]] = {}
+    async with async_session() as session:
+        for pos in positions:
+            if not pos.condition_id or pos.condition_id in cid_to_market:
+                continue
+            try:
+                m = await ensure_market(pos.condition_id, session, slug=pos.slug or None)
+                if m:
+                    cid_to_market[pos.condition_id] = m
+            except Exception as e:
+                logger.debug("EDGE: ensure_market failed for %s: %s", pos.condition_id[:10], e)
+
+        for pos in positions:
+            outcome = (pos.outcome or "").upper()
+            outcome = outcome if outcome in {"YES", "NO"} else None
+            m = cid_to_market.get(pos.condition_id)
+            if not m or not m.event_id or not m.neg_risk:
+                counts["no_event_metadata"] = counts.get("no_event_metadata", 0) + 1
+                if _note_decision(addr, pos.condition_id or "", outcome or "", "SKIP:no_event_metadata"):
+                    logger.info("EDGE_SKIP: %s %s | no_event_metadata",
+                                addr[:10], (pos.condition_id or "?")[:10])
+                await _record_edge_decision(
+                    session, addr=addr, condition_id=pos.condition_id, outcome=outcome,
+                    code="no_event_metadata",
+                    context={"slug": pos.slug, "title": pos.title},
+                )
+                continue
+            if (m.category or "").lower() != "weather":
+                counts["non_weather"] = counts.get("non_weather", 0) + 1
+                if _note_decision(addr, pos.condition_id, outcome or "", f"SKIP:non_weather:{m.category}"):
+                    logger.info("EDGE_SKIP: %s %s | non_weather:%s",
+                                addr[:10], pos.condition_id[:10], m.category)
+                await _record_edge_decision(
+                    session, addr=addr, condition_id=pos.condition_id, outcome=outcome,
+                    code="non_weather",
+                    context={"category": m.category, "event_id": m.event_id},
+                )
+                continue
+            if allowed_cities is not None:
+                city = _city_from_slug(m.slug or pos.slug or "")
+                if not city or city not in allowed_cities:
+                    counts["city_not_allowed"] = counts.get("city_not_allowed", 0) + 1
+                    if _note_decision(addr, pos.condition_id, outcome or "",
+                                      f"SKIP:city_not_allowed:{city or 'unknown'}"):
+                        logger.info(
+                            "EDGE_SKIP: %s %s | city_not_allowed:%s (allowed=%s)",
+                            addr[:10], pos.condition_id[:10], city or "unknown",
+                            ",".join(allowed_cities),
+                        )
+                    await _record_edge_decision(
+                        session, addr=addr, condition_id=pos.condition_id, outcome=outcome,
+                        code="city_not_allowed",
+                        context={"city": city, "allowed_cities": list(allowed_cities),
+                                 "event_id": m.event_id},
+                    )
+                    continue
+            events_to_eval.setdefault(m.event_id, []).append(pos)
+        await session.commit()
+
+    if not events_to_eval:
+        return counts, wallet_usdc
+
+    for event_id, evt_positions in events_to_eval.items():
+        # Halt conditions: take effect across this whale's remaining events.
+        # We open a tiny session just to record the halt reason — guarantees
+        # the SYNC COMPLETE counters reconcile against copy_decisions rows.
+        if wallet_usdc <= MIN_WALLET_USDC:
+            counts["wallet_floor"] = counts.get("wallet_floor", 0) + 1
+            logger.info("EDGE_SKIP: %s event=%s | wallet_floor wallet=$%.2f",
+                        addr[:10], event_id, wallet_usdc)
+            async with async_session() as session:
+                await _record_edge_decision(
+                    session, addr=addr, condition_id=None, outcome=None,
+                    code="wallet_floor",
+                    context={"event_id": event_id, "wallet_usdc": round(wallet_usdc, 2)},
+                )
+                await session.commit()
+            break
+        global_full = (cycle_spent.get("YES", 0.0) >= EDGE_TRADER_MAX_DIRECTION_USDC
+                       and cycle_spent.get("NO", 0.0) >= EDGE_TRADER_MAX_DIRECTION_USDC)
+        whale_full = (whale_spent.get("YES", 0.0) >= EDGE_TRADER_MAX_PER_WHALE_DIRECTION_USDC
+                      and whale_spent.get("NO", 0.0) >= EDGE_TRADER_MAX_PER_WHALE_DIRECTION_USDC)
+        if global_full:
+            counts["cycle_cap"] = counts.get("cycle_cap", 0) + 1
+            logger.info("EDGE_SKIP: %s event=%s | cycle_cap (both directions full)",
+                        addr[:10], event_id)
+            async with async_session() as session:
+                await _record_edge_decision(
+                    session, addr=addr, condition_id=None, outcome=None,
+                    code="cycle_cap",
+                    context={"event_id": event_id,
+                             "global_yes": round(cycle_spent.get("YES", 0.0), 2),
+                             "global_no": round(cycle_spent.get("NO", 0.0), 2)},
+                )
+                await session.commit()
+            break
+        if whale_full:
+            counts["whale_cap"] = counts.get("whale_cap", 0) + 1
+            logger.info("EDGE_SKIP: %s event=%s | whale_cap (both directions full)",
+                        addr[:10], event_id)
+            async with async_session() as session:
+                await _record_edge_decision(
+                    session, addr=addr, condition_id=None, outcome=None,
+                    code="whale_cap",
+                    context={"event_id": event_id,
+                             "whale_yes": round(whale_spent.get("YES", 0.0), 2),
+                             "whale_no": round(whale_spent.get("NO", 0.0), 2)},
+                )
+                await session.commit()
+            break
+        async with async_session() as session:
+            try:
+                wallet_usdc = await _evaluate_event_edge(
+                    session, addr, event_id, evt_positions, clob,
+                    wallet_usdc, mode, counts, cycle_spent, whale_spent,
+                )
+                await session.commit()
+            except Exception as e:
+                counts["error"] = counts.get("error", 0) + 1
+                logger.error("EDGE: event %s failed for %s: %s", event_id, addr[:10], e)
+                await session.rollback()
+                async with async_session() as err_session:
+                    await _record_edge_decision(
+                        err_session, addr=addr, condition_id=None, outcome=None,
+                        code="error", reason=str(e)[:200],
+                        context={"event_id": event_id},
+                    )
+                    await err_session.commit()
+    return counts, wallet_usdc
+
+
 async def _resolution_backlog_count() -> int:
     async with async_session() as session:
         result = await session.execute(
@@ -1333,6 +1950,31 @@ async def sync_whale_positions_once() -> int:
             )
         allow_new_buys = False
 
+    cycle_spent: dict[str, float] = {"YES": 0.0, "NO": 0.0}
+    whale_cycle_spent: dict[str, dict[str, float]] = {}
+
+    # Reconcile stale PENDING edge_trader trades — Polymarket auto-cancels FAK
+    # orders after a TTL expires, but the bot used to leave the row PENDING
+    # forever. Without this refresh, _copy_exposure thinks capital is committed
+    # to ghosts; new orders then over-commit and trigger "place_failed".
+    if settings.edge_trader_enabled:
+        async with async_session() as session:
+            pending = (await session.execute(
+                select(MyTrade)
+                .where(MyTrade.fill_status == "PENDING")
+                .where(MyTrade.attribution["source"].astext == "edge_trader")
+            )).scalars().all()
+            for trade in pending:
+                try:
+                    await _refresh_inflight(session, trade)
+                except Exception as e:
+                    logger.warning("EDGE: refresh failed for trade %d: %s", trade.id, e)
+            await session.commit()
+            still_pending = sum(1 for t in pending if t.fill_status == "PENDING")
+            if pending:
+                logger.info("EDGE: refreshed %d PENDING edge_trader trades (%d still pending)",
+                            len(pending) - still_pending, still_pending)
+
     try:
         for addr in settings.watch_whales:
             addr = addr.lower()
@@ -1369,24 +2011,31 @@ async def sync_whale_positions_once() -> int:
                 if p.condition_id and (p.outcome or "").upper() in {"YES", "NO"}
             }
             counts: dict[str, int] = {}
-            for pos in live_positions:
-                async with async_session() as session:
-                    try:
-                        code = await _evaluate_position(
-                            session, addr, pos, clob, wallet_usdc,
-                            allow_new_buys=allow_new_buys,
-                        ) or "unknown"
-                        counts[code] = counts.get(code, 0) + 1
-                        if code == "BUY":
-                            orders_placed += 1
-                        await session.commit()
-                    except Exception as e:
-                        counts["error"] = counts.get("error", 0) + 1
-                        logger.error(
-                            "SYNC: evaluate failed for %s: %s",
-                            pos.condition_id[:10] if pos.condition_id else "?", e,
-                        )
-                        await session.rollback()
+            if settings.edge_trader_enabled and addr in settings.edge_trader_whales:
+                whale_spent = whale_cycle_spent.setdefault(addr, {"YES": 0.0, "NO": 0.0})
+                counts, wallet_usdc = await _dispatch_edge_trader_for_whale(
+                    addr, live_positions, clob, wallet_usdc, cycle_spent, whale_spent,
+                )
+                orders_placed += counts.get("BUY", 0)
+            else:
+                for pos in live_positions:
+                    async with async_session() as session:
+                        try:
+                            code = await _evaluate_position(
+                                session, addr, pos, clob, wallet_usdc,
+                                allow_new_buys=allow_new_buys,
+                            ) or "unknown"
+                            counts[code] = counts.get(code, 0) + 1
+                            if code == "BUY":
+                                orders_placed += 1
+                            await session.commit()
+                        except Exception as e:
+                            counts["error"] = counts.get("error", 0) + 1
+                            logger.error(
+                                "SYNC: evaluate failed for %s: %s",
+                                pos.condition_id[:10] if pos.condition_id else "?", e,
+                            )
+                            await session.rollback()
             async with async_session() as session:
                 try:
                     closed = await _close_absent_whale_positions(session, addr, open_position_keys)
